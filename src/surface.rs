@@ -78,7 +78,7 @@ impl Surface {
         }
     }
 
-    /// 水平镜像后写入 DIB（朝左时用）。
+    /// 水平镜像后写入 DIB（朝右时用；素材原生朝左）。
     ///
     /// 只动像素不做预翻转副本：640×360 一行 2.5KB，整帧不到 1ms。
     pub fn upload_flipped(&mut self, frame: &[u32]) {

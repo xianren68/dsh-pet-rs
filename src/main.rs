@@ -58,6 +58,27 @@ fn main() {
     std::panic::set_hook(Box::new(|info| {
         eprintln!("[panic] {info}");
     }));
+
+    // --autorun-selftest：不开窗口，只跑一遍自启写入再撤销，用来诊断命令行
+    if std::env::args().any(|a| a == "--autorun-selftest") {
+        let was = autorun::is_enabled();
+        println!("[selftest] 当前已登记自启 = {was}");
+        match autorun::set_enabled(true) {
+            Ok(()) => println!("[selftest] 写入成功，值 = {:?}", autorun::current_command()),
+            Err(e) => {
+                println!("[selftest] 写入失败: {e}");
+                std::process::exit(1);
+            }
+        }
+        if !was {
+            match autorun::set_enabled(false) {
+                Ok(()) => println!("[selftest] 已撤销，恢复原状"),
+                Err(e) => println!("[selftest] 撤销失败: {e}"),
+            }
+        }
+        return;
+    }
+
     unsafe {
         // Per-Monitor V2：拿物理像素坐标，跨屏拖动能自适应缩放
         let dpi_ok = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -229,7 +250,8 @@ fn show_error(text: &str) {
         MessageBoxW(
             null_mut(),
             msg.as_ptr(),
-            to_wide("dsh-pet-rs 启动失败").as_ptr(),
+            // 这个框不只用于启动失败，勾自启失败之类也走这里，标题别写死"启动失败"
+            to_wide("dsh-pet-rs").as_ptr(),
             MB_ICONERROR,
         );
     }

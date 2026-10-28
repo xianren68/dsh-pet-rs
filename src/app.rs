@@ -223,6 +223,11 @@ impl App {
     /// 菜单手动点播。
     pub fn play_name(&mut self, name: &str) {
         if self.anims.contains_key(name) {
+            // 带文字的片段不能镜像：朝右时先翻回朝左再播，
+            // 否则整帧一翻，画面里的字就是反的。
+            if self.facing == Facing::Right && self.beh.is_no_mirror_clip(name) {
+                self.facing = Facing::Left;
+            }
             self.open(name);
             self.phase = Phase::Manual;
             self.paint();

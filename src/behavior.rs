@@ -185,6 +185,16 @@ impl Behavior {
     pub fn category_weight(&self) -> u32 {
         self.categories.iter().map(|c| c.weight).sum()
     }
+
+    /// 这个片段是否属于「带文字、镜像会颠倒」的分类。
+    ///
+    /// 随机链靠 `Category::no_mirror` 跳过整类；手动点播（右键菜单）不经过那条路，
+    /// 得单独查一下，否则朝右点播就会把字镜像过去。
+    pub fn is_no_mirror_clip(&self, name: &str) -> bool {
+        self.categories
+            .iter()
+            .any(|c| c.no_mirror && c.actions.iter().any(|a| a == name))
+    }
 }
 
 /// 去掉 `//` 行注释（字符串内的不碰），让配置能带说明。

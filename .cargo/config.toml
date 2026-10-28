@@ -1,0 +1,3 @@
+[target.x86_64-pc-windows-msvc]
+# 静态链接 CRT：免装 VC++ 运行库，解压即用（体积约 +150 KB）
+rustflags = ["-C", "target-feature=+crt-static"]

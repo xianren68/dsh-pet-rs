@@ -5,7 +5,7 @@
 
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
     HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ,
@@ -17,7 +17,7 @@ const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const VALUE_NAME: &str = "dsh-pet-rs";
 const EXPECTED_TYPE: u32 = REG_SZ;
 
-fn open_key(access: u32) -> Option<HKEY> {
+fn open_key(access: u32) -> Result<HKEY, u32> {
     let sub = to_wide(RUN_KEY);
     let mut hkey: HKEY = null_mut();
     let rc = unsafe {
@@ -30,15 +30,25 @@ fn open_key(access: u32) -> Option<HKEY> {
         )
     };
     if rc == ERROR_SUCCESS {
-        Some(hkey)
+        Ok(hkey)
     } else {
-        None
+        Err(rc)
+    }
+}
+
+/// 把注册表错误码翻成人话，省得用户只看到一个数字。
+fn reg_hint(rc: u32) -> &'static str {
+    match rc {
+        5 => "，权限被拒绝，多半是安全软件拦了启动项写入",
+        2 => "，Run 项不存在",
+        87 => "，参数有问题",
+        _ => "",
     }
 }
 
 /// 当前是否已登记自启（只看值存不存在，不校验路径是否过期）。
 pub fn is_enabled() -> bool {
-    let Some(hkey) = open_key(KEY_QUERY_VALUE) else {
+    let Ok(hkey) = open_key(KEY_QUERY_VALUE) else {
         return false;
     };
     let name = to_wide(VALUE_NAME);
@@ -55,14 +65,13 @@ pub fn is_enabled() -> bool {
         )
     };
     unsafe { RegCloseKey(hkey) };
-    rc != ERROR_FILE_NOT_FOUND && rc == ERROR_SUCCESS
+    rc == ERROR_SUCCESS
 }
 
 /// 开 / 关自启。
 pub fn set_enabled(on: bool) -> Result<(), String> {
-    let Some(hkey) = open_key(KEY_SET_VALUE) else {
-        return Err("打不开注册表 Run 项".into());
-    };
+    let hkey = open_key(KEY_SET_VALUE)
+        .map_err(|rc| format!("打不开注册表 Run 项，错误码 {rc}{}", reg_hint(rc)))?;
     let name = to_wide(VALUE_NAME);
 
     let rc = if on {
@@ -90,14 +99,14 @@ pub fn set_enabled(on: bool) -> Result<(), String> {
     if rc == ERROR_SUCCESS {
         Ok(())
     } else {
-        Err(format!("注册表写入失败，错误码 {rc}"))
+        Err(format!("注册表写入失败，错误码 {rc}{}", reg_hint(rc)))
     }
 }
 
 /// 读一下当前登记的命令行（调试用）。
 #[allow(dead_code)]
 pub fn current_command() -> Option<String> {
-    let hkey = open_key(KEY_QUERY_VALUE)?;
+    let hkey = open_key(KEY_QUERY_VALUE).ok()?;
     let name = to_wide(VALUE_NAME);
     let mut buf = vec![0u16; 512];
     let mut size = (buf.len() * 2) as u32;
