@@ -2,7 +2,7 @@
 
 一个极简的 Windows 桌宠：透明置顶、106 段动作、能拖能甩，单文件 743 KB。
 
-> ## 👉 先看原项目：[PC2005-cloud/dsh-pet](https://github.com/PC2005-cloud/dsh-pet)
+> ## 先看原项目：[PC2005-cloud/dsh-pet](https://github.com/PC2005-cloud/dsh-pet)
 >
 > 这个项目是它的**减法版**，素材、动作分类、行为权重全部来自那边。
 >
