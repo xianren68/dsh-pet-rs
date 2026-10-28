@@ -3,6 +3,7 @@
 /assets/anims/
 /assets/icon.ico
 /assets/settings.json
+/.workbuddy/
 *.clipcache
 *.webm
 *.png
