@@ -1,0 +1,33 @@
+[package]
+name = "dsh-pet-rs"
+version = "0.1.0"
+edition = "2021"
+description = "极简原生桌宠（Win32 分层窗 + APNG 帧动画）"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "gif"] }
+image-webp = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_HiDpi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Registry",
+] }
+
+[build-dependencies]
+embed-resource = "3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
