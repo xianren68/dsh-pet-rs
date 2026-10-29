@@ -69,6 +69,17 @@ impl Surface {
         }
     }
 
+    /// 供气泡等自绘模块使用的 GDI 画布。
+    pub fn hdc(&self) -> HDC {
+        self.hdc
+    }
+
+    /// 像素缓冲（0xAARRGGBB）。GDI 只写 RGB，alpha 需要调用方补。
+    pub fn pixels(&mut self) -> &mut [u32] {
+        let n = (self.w * self.h).max(0) as usize;
+        unsafe { std::slice::from_raw_parts_mut(self.bits, n) }
+    }
+
     /// 把一整帧 BGRA（`0xAARRGGBB`，小端）拷进 DIB。
     pub fn upload(&mut self, frame: &[u32]) {
         let n = (self.w * self.h).max(0) as usize;

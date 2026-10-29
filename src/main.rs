@@ -8,9 +8,12 @@
 mod app;
 mod autorun;
 mod behavior;
+mod bubble;
 mod clip;
+mod event;
 mod icon;
 mod scale;
+mod sense;
 mod settings;
 mod surface;
 mod tray;
@@ -21,18 +24,29 @@ use std::mem::{size_of, zeroed};
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Power::{
+    RegisterPowerSettingNotification, UnregisterPowerSettingNotification, HPOWERNOTIFY,
+    POWERBROADCAST_SETTING,
+};
+use windows_sys::Win32::System::RemoteDesktop::{
+    WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
+};
+use windows_sys::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
 use windows_sys::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse as km;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, LoadCursorW,
-    PostQuitMessage, RegisterClassExW, SetProcessDPIAware, SetTimer, ShowWindow, TranslateMessage,
-    IDC_HAND, MA_NOACTIVATE, MSG, SW_SHOWNOACTIVATE, WM_CLOSE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW,
+    LoadCursorW, PostQuitMessage, RegisterClassExW, SetProcessDPIAware, SetTimer, ShowWindow,
+    TranslateMessage, DEVICE_NOTIFY_WINDOW_HANDLE, IDC_HAND, MA_NOACTIVATE, MSG,
+    PBT_APMPOWERSTATUSCHANGE, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
+    PBT_POWERSETTINGCHANGE, SW_SHOWNOACTIVATE, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE,
+    WM_POWERBROADCAST, WM_RBUTTONUP, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSEXW, WS_EX_LAYERED,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 
 use app::App;
@@ -41,6 +55,8 @@ use util::to_wide;
 
 const TIMER_FRAME: usize = 1;
 const FRAME_MS: u32 = 16;
+const TIMER_SENSE: usize = 2;
+const SENSE_MS: u32 = 1_000;
 
 thread_local! {
     static APP: RefCell<Option<App>> = RefCell::new(None);
@@ -91,6 +107,11 @@ fn main() {
         let hinstance = GetModuleHandleW(null());
         let class_name = to_wide("DshPetRsWindow");
 
+        if !FindWindowW(class_name.as_ptr(), null()).is_null() {
+            show_error("dsh-pet-rs 已经在运行了。\n\n双击托盘图标可以打开设置。");
+            return;
+        }
+
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             style: 0,
@@ -135,6 +156,22 @@ fn main() {
             return;
         }
 
+        // 屏幕亮灭（GUID_CONSOLE_DISPLAY_STATE）走 PowerSetting 通知；
+        // 锁屏/解锁走 WTS 会话通知。都失败也不影响桌宠本体。
+        let power_notify: HPOWERNOTIFY = RegisterPowerSettingNotification(
+            hwnd as HANDLE,
+            &GUID_CONSOLE_DISPLAY_STATE,
+            DEVICE_NOTIFY_WINDOW_HANDLE,
+        );
+        if power_notify == 0 {
+            eprintln!("[power] RegisterPowerSettingNotification 失败");
+        }
+        let session_notify =
+            WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) != 0;
+        if !session_notify {
+            eprintln!("[session] WTSRegisterSessionNotification 失败");
+        }
+
         let Some(assets) = asset_dir() else {
             let msg = "找不到素材目录。\n\n把打包里的 assets 文件夹放在 exe 同级，\n\
                        或放到 %APPDATA%\\dsh-pet-rs\\assets 下。";
@@ -173,6 +210,23 @@ fn main() {
         // 先显示再起定时器：paint 已在 App::new 里做过一次，首帧就是完整画面
         ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
+        // 调试/测试参数
+        let has_play = std::env::args().any(|a| a == "--play");
+        let wants_settings = std::env::args().any(|a| a == "--settings");
+        let simulate = arg_value("--simulate");
+        let debug_events = std::env::args().any(|a| a == "--debug-events");
+        if has_play || wants_settings || simulate.is_some() {
+            with_app(|app| app.skip_startup_greeting());
+        }
+        if debug_events {
+            with_app(|app| app.set_debug(true));
+        }
+        if let Some(v) = arg_value("--greet-at") {
+            if let Some(minutes) = event::parse_hm(&v) {
+                with_app(|app| app.set_test_minutes(Some(minutes)));
+            }
+        }
+
         // --play "<动作名>"：启动即播某段，调试用
         if let Some(i) = std::env::args().position(|a| a == "--play") {
             if let Some(name) = std::env::args().nth(i + 1) {
@@ -180,11 +234,16 @@ fn main() {
             }
         }
 
+        if let Some(spec) = simulate {
+            with_app(|app| app.simulate(&spec));
+        }
+
         // 带 --settings 启动时直接开设置面板（给快捷方式用）
-        if std::env::args().any(|a| a == "--settings") {
+        if wants_settings {
             settings::show();
         }
         SetTimer(hwnd, TIMER_FRAME, FRAME_MS, None);
+        SetTimer(hwnd, TIMER_SENSE, SENSE_MS, None);
 
         let mut msg: MSG = zeroed();
         loop {
@@ -197,10 +256,25 @@ fn main() {
             DispatchMessageW(&msg);
         }
 
+        with_app(|app| app.save_on_exit());
+        bubble::destroy();
+        if power_notify != 0 {
+            UnregisterPowerSettingNotification(power_notify);
+        }
+        if session_notify {
+            WTSUnRegisterSessionNotification(hwnd);
+        }
         if let Some(t) = tray.as_mut() {
             t.destroy();
         }
     }
+}
+
+/// 取 `--foo value` 里的 value。
+fn arg_value(name: &str) -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let i = args.iter().position(|a| a == name)?;
+    args.get(i + 1).cloned()
 }
 
 /// 素材目录（只读）：exe 同级 `assets` → `%APPDATA%\dsh-pet-rs\assets` → 开发期工程目录。
@@ -257,14 +331,24 @@ fn show_error(text: &str) {
     }
 }
 
+fn guid_eq(a: &windows_sys::core::GUID, b: &windows_sys::core::GUID) -> bool {
+    a.data1 == b.data1 && a.data2 == b.data2 && a.data3 == b.data3 && a.data4 == b.data4
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         // 点宠物不给焦点，其他程序保持前台
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
 
         WM_TIMER => {
-            if wparam == TIMER_FRAME {
-                with_app(|app| app.tick());
+            match wparam {
+                TIMER_FRAME => {
+                    with_app(|app| app.tick());
+                }
+                TIMER_SENSE => {
+                    with_app(|app| app.poll_senses());
+                }
+                _ => {}
             }
             0
         }
@@ -318,6 +402,60 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             0
         }
 
+        WM_POWERBROADCAST => {
+            match wparam as u32 {
+                PBT_APMPOWERSTATUSCHANGE => {
+                    with_app(|app| app.poll_power());
+                }
+                PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => {
+                    with_app(|app| app.on_resume());
+                }
+                PBT_APMSUSPEND => {
+                    with_app(|app| app.on_suspend());
+                }
+                PBT_POWERSETTINGCHANGE => {
+                    let p = lparam as *const POWERBROADCAST_SETTING;
+                    if !p.is_null() {
+                        let setting = &*p;
+                        if guid_eq(&setting.PowerSetting, &GUID_CONSOLE_DISPLAY_STATE)
+                            && setting.DataLength >= 1
+                        {
+                            // 0=关屏 1=开屏 2=变暗；只有真正开屏才问好
+                            let on = setting.Data[0] == 1;
+                            with_app(|app| app.on_display(on));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            0
+        }
+
+        WM_WTSSESSION_CHANGE => {
+            match wparam as u32 {
+                WTS_SESSION_LOCK => {
+                    with_app(|app| app.on_session(true));
+                }
+                WTS_SESSION_UNLOCK => {
+                    with_app(|app| app.on_session(false));
+                }
+                _ => {}
+            }
+            0
+        }
+
+        WM_DISPLAYCHANGE => {
+            with_app(|app| app.on_display_change());
+            0
+        }
+
+        WM_ENDSESSION => {
+            if wparam != 0 {
+                with_app(|app| app.save_on_exit());
+            }
+            0
+        }
+
         WM_DESTROY => {
             PostQuitMessage(0);
             0
@@ -340,15 +478,7 @@ fn handle_command(hwnd: HWND, cmd: u32, flat: &[String]) {
     match cmd {
         tray::CMD_SHOW => {
             with_app(|app| {
-                let vis = app.toggle_visible();
-                unsafe {
-                    if vis {
-                        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                        app.repaint();
-                    } else {
-                        ShowWindow(hwnd, 0); // SW_HIDE
-                    }
-                }
+                app.toggle_visible();
             });
         }
         tray::CMD_HOME => {

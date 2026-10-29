@@ -1,6 +1,9 @@
 //! Win32 小工具：宽字符串、光标、工作区、随机数。
 
 use windows_sys::Win32::Foundation::{POINT, RECT};
+use windows_sys::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, SystemParametersInfoW, SPI_GETWORKAREA,
 };
@@ -33,6 +36,24 @@ pub fn work_area() -> RECT {
         };
     }
     r
+}
+
+/// 某个屏幕坐标所在显示器的工作区（已排除任务栏）。
+///
+/// 多屏时不能再用 `SPI_GETWORKAREA`——那只返回主屏，宠物被拖到副屏后会
+/// 被“吸”回主屏。`MonitorFromPoint` 找不到时按最近显示器处理。
+pub fn work_area_at(x: i32, y: i32) -> RECT {
+    unsafe {
+        let hmon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        if !hmon.is_null() {
+            let mut mi: MONITORINFO = std::mem::zeroed();
+            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(hmon, &mut mi) != 0 {
+                return mi.rcWork;
+            }
+        }
+    }
+    work_area()
 }
 
 /// 够用的 xorshift，避免为挑动画引一个 rand 依赖。

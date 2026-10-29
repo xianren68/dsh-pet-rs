@@ -1,0 +1,222 @@
+// dsh-pet-rs 环境事件配置（v0.2.0）
+//
+// 这份文件只描述“什么时候做什么”，代码里没有动作映射表。
+// 改完保存后，托盘右键「重载素材」即可生效，不用重新编译。
+//
+// 约定：
+//   - 缺某个事件键 = 关掉这个事件。
+//   - actions 为空数组 = 只弹气泡，不切动画。
+//   - bubble 省略 = 不弹气泡。
+//   - 动作名必须和 assets/anims 下的文件名（去扩展名）一致。
+//   - 模板变量：{pct} 电量百分比，{name} 文件名，{size} 文件大小，{time} 当前时间。
+{
+  "globalCooldownSec": 8,
+
+  // 气泡外观。字号、圆角、内边距、最大宽度都是 96 DPI 下的逻辑值，
+  // 实际会按系统 DPI 缩放；颜色写 #RRGGBB，alpha 是整体不透明度。
+  "bubbleStyle": {
+    "fontFamily": "Microsoft YaHei UI",
+    "fontSize": 16,
+    "fontWeight": 400,
+    "textColor": "#FFFFFF",
+    "backgroundColor": "#2B2B2B",
+    "alpha": 240,
+    "cornerRadius": 7,
+    "padding": 12,
+    "maxWidth": 320,
+    "durationMs": 4000
+  },
+
+  "sensors": {
+    "battery": {
+      "lowPct": 20,
+      "criticalPct": 10,
+      "pollSec": 60
+    },
+    "network": {
+      "pollSec": 15,
+      "confirmTicks": 2
+    },
+    "idle": {
+      "sleepSec": 600,
+      "wakeSec": 5
+    },
+    "download": {
+      // 留空自动找系统“下载”文件夹；也可以写绝对路径。
+      "dir": "",
+      "pollSec": 2,
+      "tempExts": [
+        ".crdownload",
+        ".part",
+        ".opdownload",
+        ".download",
+        ".!qb",
+        ".aria2",
+        ".td",
+        ".xltd"
+      ]
+    },
+    "fullscreen": {
+      "pollSec": 2
+    }
+  },
+
+  "events": {
+    "batteryLow": {
+      "actions": [],
+      "bubble": "电量只剩 {pct}% 了…",
+      "priority": 80,
+      "cooldownSec": 600,
+      "interrupt": true
+    },
+    "batteryCritical": {
+      "actions": [],
+      "bubble": "快充电！只剩 {pct}% 了",
+      "priority": 90,
+      "cooldownSec": 300,
+      "interrupt": true
+    },
+    "batteryCharging": {
+      "actions": ["余额-钱袋满溢"],
+      "bubble": "充上电啦",
+      "priority": 50,
+      "cooldownSec": 60,
+      "interrupt": false
+    },
+    "batteryFull": {
+      "actions": ["余额-金袋叮当"],
+      "bubble": "电充满啦",
+      "priority": 40,
+      "cooldownSec": 3600,
+      "interrupt": false
+    },
+
+    "networkDown": {
+      "actions": [],
+      "bubble": "网断了…",
+      "priority": 70,
+      "cooldownSec": 300,
+      "interrupt": true
+    },
+    "networkUp": {
+      "actions": [],
+      "bubble": "网回来啦",
+      "priority": 40,
+      "cooldownSec": 300,
+      "interrupt": false
+    },
+
+    "downloadStart": {
+      "actions": [],
+      "bubble": "「{name}」开始下载",
+      "priority": 30,
+      "cooldownSec": 10,
+      "interrupt": false
+    },
+    "downloadDone": {
+      "actions": ["拆礼物", "收红包"],
+      "bubble": "「{name}」下好啦（{size}）",
+      "priority": 50,
+      "cooldownSec": 3,
+      "interrupt": false
+    },
+    "downloadFailed": {
+      "actions": [],
+      "bubble": "「{name}」好像没下成",
+      "priority": 50,
+      "cooldownSec": 10,
+      "interrupt": false
+    },
+
+    "idleSleep": {
+      "actions": ["原地小憩沉眠"],
+      "priority": 30,
+      "cooldownSec": 60,
+      "interrupt": false,
+      "hold": true
+    },
+    "idleWake": {
+      "actions": ["超大伸懒腰"],
+      "priority": 40,
+      "cooldownSec": 60,
+      "interrupt": true
+    },
+
+    "sessionLock": {
+      "actions": ["原地小憩沉眠"],
+      "priority": 30,
+      "cooldownSec": 60,
+      "interrupt": false,
+      "hold": true
+    },
+    "sessionUnlock": {
+      "actions": ["哈欠连天"],
+      "priority": 40,
+      "cooldownSec": 30,
+      "interrupt": true
+    },
+    "resume": {
+      "actions": ["超大伸懒腰"],
+      "priority": 40,
+      "cooldownSec": 60,
+      "interrupt": true
+    }
+  },
+
+  "greetings": {
+    // 离开至少 60 秒才问好；两次问好至少隔 10 分钟。
+    "minAwaySec": 60,
+    "cooldownSec": 600,
+    // 离开超过一天算“好久不见”。
+    "longAwaySec": 86400,
+    // 启动后延迟 1.5 秒，避开首帧加载。
+    "startupDelayMs": 1500,
+
+    "longAwayTexts": ["好久不见，想你了", "你回来啦！"],
+    "longAwayActions": [],
+
+    "fallbackTexts": ["我在这里陪你呀"],
+    "fallbackActions": [],
+
+    // 时间段两端都包含，支持跨午夜（23:00–04:59）。
+    // actions 留空就是只问好、不切动画。
+    "slots": [
+      {
+        "from": "05:00",
+        "to": "08:59",
+        "texts": ["早上好呀，今天也一起加油", "早上好！先伸个懒腰吧"],
+        "actions": []
+      },
+      {
+        "from": "09:00",
+        "to": "11:29",
+        "texts": ["上午好呀", "上午好，记得喝水"],
+        "actions": []
+      },
+      {
+        "from": "11:30",
+        "to": "13:29",
+        "texts": ["中午好，吃饭了吗？", "午休一下吧"],
+        "actions": []
+      },
+      {
+        "from": "13:30",
+        "to": "17:59",
+        "texts": ["下午好，别太累", "下午好呀"],
+        "actions": []
+      },
+      {
+        "from": "18:00",
+        "to": "22:59",
+        "texts": ["晚上好呀", "今天辛苦啦"],
+        "actions": []
+      },
+      {
+        "from": "23:00",
+        "to": "04:59",
+        "texts": ["夜深了，早点休息", "该睡觉啦"],
+        "actions": []
+      }
+    ]
+  }
+}

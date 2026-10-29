@@ -7,9 +7,10 @@
 
   产物：
     dist\dsh-pet-rs\
-      dsh-pet-rs.exe        ~740 KB
+      dsh-pet-rs.exe        ~1 MB
       assets\anims\*.webp   106 段动作
       assets\behaviors.json 行为配置
+      assets\events.json    环境事件 / 传感器 / 问好
       README.md
       使用说明.txt
 #>
@@ -42,6 +43,7 @@ $assetsOut = Join-Path $pkg "assets"
 $animsOut = Join-Path $assetsOut "anims"
 New-Item -ItemType Directory -Path $animsOut -Force | Out-Null
 Copy-Item (Join-Path $root "assets\behaviors.json") $assetsOut
+Copy-Item (Join-Path $root "assets\events.json") $assetsOut
 
 # 只收素材本体，跳过 .clipcache（运行时按需重建）
 $n = 0
@@ -74,12 +76,29 @@ dsh-pet-rs —— 极简原生 Windows 桌宠
   行为倾向      待机 / 转向 / 走动 三档相对权重
   原地待机      勾上后不自己走、不自己转朝向
   开机自动启动  写 HKCU 的 Run 项，取消勾选即移除
+  环境感知      电量 / 网络 / 下载 / 空闲 / 锁屏 / 全屏 /
+                点亮屏幕问好 / 启动问好 / 气泡 / 文件名
+  位置记忆      拖到哪，下次启动还在哪；换屏会自动夹回
+
+【环境感知】
+  全部是本地规则，不联网、没有 AI、没有全局键鼠钩子。
+  规则在 assets\events.json：
+    电量低 / 充满、网络断开 / 恢复、下载开始 / 完成 / 失败、
+    空闲睡觉 / 醒来、锁屏 / 解锁 / 睡眠恢复、按时间段问好。
+  气泡样式也在 events.json 的 bubbleStyle：字体、字号、字重、
+    文字色、背景色、透明度、圆角、内边距、最大宽度、显示时长。
+  actions 留空数组 = 只弹气泡；改完托盘右键“重载素材”生效。
+  问好默认 10 分钟冷却；全屏应用时自动隐藏，设置里可关。
 
 【文件在哪】
   素材目录   exe 同级的 assets\
+             anims\*.webp      106 段动作
+             behaviors.json    动画池 / 权重 / 物理
+             events.json       环境事件 / 传感器 / 问好
   配置目录   %APPDATA%\dsh-pet-rs\
-             settings.json  面板里的设置
-             icon.ico       托盘图标（从待机动画第一帧生成）
+             settings.json     面板设置、事件开关、位置
+             dsh-pet-rs-events.log  --debug-events 事件日志（不可写则退到 %TEMP%）
+             icon.ico          托盘图标（从待机动画第一帧生成）
 
   配置放在 APPDATA，是为了让程序装到 Program Files 这类
   只读目录时也能保存设置。
@@ -87,13 +106,23 @@ dsh-pet-rs —— 极简原生 Windows 桌宠
 【换素材】
   把 .webp / .apng / .gif 丢进 assets\anims\，右键托盘
   “重载素材”即可，不用重启。
-  文件名（去扩展名）就是 behaviors.json 里引用的动作名；
-  文件名以 idle 开头的那段作为待机。
+  文件名（去扩展名）就是 behaviors.json / events.json 里
+  引用的动作名。
 
   想改行为权重、动作分类，编辑 assets\behaviors.json。
+  想改环境反应、电量阈值、问好时段，编辑 assets\events.json。
+
+【命令行】
+  dsh-pet-rs.exe --settings
+  dsh-pet-rs.exe --play "动作名"
+  dsh-pet-rs.exe --simulate "downloadDone:test.zip:1048576,greet:20:30"
+  dsh-pet-rs.exe --greet-at 20:30 --simulate greet
+  dsh-pet-rs.exe --debug-events
+  同一时间只会运行一只；重复双击会提示已在运行。
 
 【兼容性】
   Windows 10 / 11，64 位。
+  环境感知没有使用 Win8+ 独占 API；Win7 构建见 win7-compat 分支。
   首次运行会在配置目录生成 icon.ico，属正常现象。
 
 【版权】

@@ -4,17 +4,34 @@
 //! animationWeights / physics 三段）：
 //! 每段动画播完按权重抽下一档 —— 待机 / 转向 / 移动 / 随机分类，
 //! 分类内先按分类权重抽类、再类内等概率抽动作。
+//!
+//! 环境事件（电量、网络、下载、空闲、锁屏、全屏、问好）来自
+//! `assets/events.json`，代码里没有动作映射表。
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
-use windows_sys::Win32::Foundation::RECT;
+use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::System::SystemInformation::GetTickCount;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    SetWindowPos, ShowWindow, HWND_TOPMOST, SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SW_SHOWNOACTIVATE,
+};
 
 use crate::behavior::{Behavior, Category, MoveAction};
+use crate::bubble;
 use crate::clip::{Clip, Stream};
+use crate::event::{self, EventKey, EventsFile, Vars};
+use crate::sense::{Sense, Signal};
 use crate::surface::Surface;
-use crate::util::{cursor, work_area, Rng};
+use crate::util::{cursor, work_area, work_area_at, Rng};
+
+/// `--debug-events` 的日志文件。优先配置目录，不可写时退到临时目录。
+static EVENT_LOG: OnceLock<PathBuf> = OnceLock::new();
+static EVENT_LOG_WARNED: OnceLock<()> = OnceLock::new();
+static CONFIG_WARNED: OnceLock<()> = OnceLock::new();
 
 /// 宠物朝向。
 ///
@@ -46,6 +63,8 @@ enum Phase {
     Click,
     Drag,
     Manual,
+    /// 事件动作；`event_hold` 决定播完是否定格重播。
+    Event,
 }
 
 struct Drag {
@@ -62,14 +81,65 @@ struct MovePlan {
     dx: f32,
 }
 
+struct PendingEvent {
+    key: EventKey,
+    action: Option<String>,
+    text: Option<String>,
+    priority: u8,
+    interrupt: bool,
+    hold: bool,
+    no_mirror: bool,
+    at: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GreetReason {
+    Startup,
+    Display,
+    Unlock,
+    Resume,
+    Simulated,
+}
+
+/// 设置面板用的开关集合。
+#[derive(Clone, Copy)]
+pub struct EventToggles {
+    pub battery: bool,
+    pub network: bool,
+    pub download: bool,
+    pub idle: bool,
+    pub lock: bool,
+    pub fullscreen: bool,
+    pub greet: bool,
+    pub greet_startup: bool,
+    pub bubble: bool,
+    pub bubble_names: bool,
+}
+
+#[derive(Clone, Copy)]
+pub enum Toggle {
+    Battery,
+    Network,
+    Download,
+    Idle,
+    Lock,
+    Fullscreen,
+    Greet,
+    GreetStartup,
+    Bubble,
+    BubbleNames,
+}
+
 pub struct App {
-    hwnd: windows_sys::Win32::Foundation::HWND,
+    hwnd: HWND,
     surface: Surface,
 
     anims: HashMap<String, PathBuf>,
     loaded: HashMap<String, Clip>,
 
     beh: Behavior,
+    events: EventsFile,
+    sense: Sense,
     phase: Phase,
     cur_name: String,
     frame: usize,
@@ -85,26 +155,41 @@ pub struct App {
     drag: Option<Drag>,
     move_plan: Option<MovePlan>,
 
+    pending: Vec<PendingEvent>,
+    last_fire: HashMap<EventKey, u32>,
+    last_event_at: u32,
+    event_hold: bool,
+    last_greet: u32,
+    startup_greet_at: Option<u32>,
+    last_wake_at: Option<u32>,
+    fullscreen_hidden: bool,
+    bubble_until: u32,
+
     last_tick: u32,
     rng: Rng,
     visible: bool,
+    dirty: bool,
+    topmost_tick: u32,
+    debug: bool,
+    test_minutes: Option<u32>,
+
     /// 素材目录（只读）
     assets: PathBuf,
     /// 配置目录（可写，通常 %APPDATA%\dsh-pet-rs）
     cfg: PathBuf,
-    /// 面板写下的用户偏好（尺寸/不透明度/固定/权重）
+    /// 面板写下的用户偏好（尺寸/不透明度/固定/权重/事件开关/位置）
     user: UserSettings,
 }
 
 impl App {
-    pub fn new(
-        hwnd: windows_sys::Win32::Foundation::HWND,
-        assets: PathBuf,
-        cfg: PathBuf,
-    ) -> Result<Self, String> {
+    pub fn new(hwnd: HWND, assets: PathBuf, cfg: PathBuf) -> Result<Self, String> {
         let beh = Behavior::load(&assets.join("behaviors.json")).unwrap_or_else(|e| {
             eprintln!("[behavior] {e}，改用内置默认");
             Behavior::default()
+        });
+        let events = EventsFile::load(&assets.join("events.json")).unwrap_or_else(|e| {
+            eprintln!("[events] {e}，环境事件已关闭");
+            EventsFile::default()
         });
         let anims = scan_anims(&assets)?;
         if anims.is_empty() {
@@ -131,10 +216,56 @@ impl App {
 
         let wa: RECT = work_area();
         let margin = 48;
-        let pos = (
+        let fallback = (
             (wa.right - want_w as i32 - margin) as f32,
             (wa.bottom - want_h as i32 - margin) as f32,
         );
+        let pos = match (user.x, user.y) {
+            (Some(x), Some(y)) => {
+                let here = work_area_at(
+                    x + want_w as i32 / 2,
+                    y + want_h as i32 / 2,
+                );
+                if x + want_w as i32 > here.left
+                    && x < here.right
+                    && y + want_h as i32 > here.top
+                    && y < here.bottom
+                {
+                    (x as f32, y as f32)
+                } else {
+                    fallback
+                }
+            }
+            _ => fallback,
+        };
+        // 记住的位置只要还和某块屏幕有交集就沿用，但保证整只宠物可见。
+        let here = work_area_at(
+            pos.0 as i32 + want_w as i32 / 2,
+            pos.1 as i32 + want_h as i32 / 2,
+        );
+        let pos = (
+            pos.0.clamp(
+                here.left as f32,
+                (here.right - want_w as i32).max(here.left) as f32,
+            ),
+            pos.1.clamp(
+                here.top as f32,
+                (here.bottom - want_h as i32).max(here.top) as f32,
+            ),
+        );
+
+        let now = unsafe { GetTickCount() };
+        let has_greeting = !events.greetings.slots.is_empty()
+            || !events.greetings.long_away_texts.is_empty()
+            || !events.greetings.long_away_actions.is_empty()
+            || !events.greetings.fallback_texts.is_empty()
+            || !events.greetings.fallback_actions.is_empty();
+        let startup_greet_at = if user.greet_startup && has_greeting {
+            Some(now.wrapping_add(events.greetings.startup_delay_ms))
+        } else {
+            None
+        };
+        let sense = Sense::new(&events.sensors);
 
         let mut loaded = HashMap::new();
         loaded.insert(first.clone(), clip);
@@ -145,6 +276,8 @@ impl App {
             anims,
             loaded,
             beh,
+            events,
+            sense,
             phase: Phase::Idle,
             cur_name: first,
             frame: 0,
@@ -158,21 +291,36 @@ impl App {
             facing: Facing::Left,
             drag: None,
             move_plan: None,
-            last_tick: unsafe { GetTickCount() },
+            pending: Vec::new(),
+            last_fire: HashMap::new(),
+            last_event_at: 0,
+            event_hold: false,
+            last_greet: 0,
+            startup_greet_at,
+            last_wake_at: None,
+            fullscreen_hidden: false,
+            bubble_until: 0,
+            last_tick: now,
             rng: Rng::new(),
             visible: true,
+            dirty: true,
+            topmost_tick: 0,
+            debug: false,
+            test_minutes: None,
             assets,
             cfg,
             user,
         };
         app.apply_user();
+        app.validate_events();
 
         let name = app.cur_name.clone();
         app.open(&name);
         app.paint();
         eprintln!(
-            "[init] anims={} size={}x{} pos=({:.0},{:.0})",
+            "[init] anims={} events={} size={}x{} pos=({:.0},{:.0})",
             app.anims.len(),
+            app.events.events.len(),
             app.surface.w,
             app.surface.h,
             app.pos.0,
@@ -213,11 +361,22 @@ impl App {
 
     pub fn toggle_visible(&mut self) -> bool {
         self.visible = !self.visible;
+        if self.visible {
+            if !self.fullscreen_hidden {
+                unsafe {
+                    ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+                }
+                self.dirty = true;
+                self.paint();
+            }
+        } else {
+            unsafe {
+                ShowWindow(self.hwnd, SW_HIDE);
+            }
+            bubble::hide();
+            self.bubble_until = 0;
+        }
         self.visible
-    }
-
-    pub fn repaint(&mut self) {
-        self.paint();
     }
 
     /// 菜单手动点播。
@@ -228,8 +387,10 @@ impl App {
             if self.facing == Facing::Right && self.beh.is_no_mirror_clip(name) {
                 self.facing = Facing::Left;
             }
+            self.event_hold = false;
             self.open(name);
             self.phase = Phase::Manual;
+            self.dirty = true;
             self.paint();
         }
     }
@@ -378,7 +539,7 @@ impl App {
 
         let span = p.max_dist.saturating_sub(p.min_dist) + 1;
         let dist = p.min_dist + (self.rng.next_u32() % span);
-        let wa: RECT = work_area();
+        let wa = self.monitor_area();
         let w = self.surface.w as f32;
         let lo = wa.left as f32 + p.margin as f32;
         let hi = (wa.right as f32 - w - p.margin as f32).max(lo);
@@ -422,6 +583,7 @@ impl App {
     fn react(&mut self) {
         let pool = self.beh.clicks.clone();
         if let Some(n) = pick(&mut self.rng, &pool) {
+            self.event_hold = false;
             self.open(&n);
             self.phase = Phase::Click;
         }
@@ -435,28 +597,63 @@ impl App {
         self.last_tick = now;
         dt = dt.clamp(0.0, 0.06);
 
+        let mut changed = false;
         if self.flying {
             self.step_physics(dt);
+            changed = true;
         }
-        self.step_move(now);
-        self.step_anim((dt * 1000.0) as u32);
-        self.paint();
+        if self.step_move(now) {
+            changed = true;
+        }
+        if self.step_anim((dt * 1000.0) as u32) {
+            changed = true;
+        }
+
+        if self.bubble_until != 0 && now >= self.bubble_until {
+            bubble::hide();
+            self.bubble_until = 0;
+        }
+
+        if let Some(at) = self.startup_greet_at {
+            if now >= at {
+                self.startup_greet_at = None;
+                self.maybe_greet(GreetReason::Startup, None, now, false);
+                changed = true;
+            }
+        }
+
+        self.try_events(false);
+
+        if self.dirty || changed {
+            self.paint();
+        }
+
+        self.topmost_tick = self.topmost_tick.wrapping_add(1);
+        if self.topmost_tick >= 1800 {
+            self.topmost_tick = 0;
+            self.reassert_topmost();
+        }
     }
 
-    fn step_move(&mut self, now: u32) {
-        let Some(mp) = &self.move_plan else { return };
+    fn step_move(&mut self, now: u32) -> bool {
+        let Some(mp) = &self.move_plan else {
+            return false;
+        };
         let el = now.wrapping_sub(mp.start_ms);
+        let mut changed = false;
         if el > mp.lead_ms {
             let t = ((el - mp.lead_ms) as f32 / mp.dur_ms as f32).min(1.0);
             self.pos.0 = mp.from_x + mp.dx * t;
+            changed = true;
         }
         if el > mp.lead_ms + mp.dur_ms {
             self.move_plan = None;
         }
+        changed
     }
 
     fn paint(&mut self) {
-        if self.px.is_empty() {
+        if self.px.is_empty() || !self.visible || self.fullscreen_hidden {
             return;
         }
         let dw = self.surface.w as usize;
@@ -486,13 +683,20 @@ impl App {
             self.pos.1 as i32,
             self.user.alpha,
         );
+        self.dirty = false;
+        bubble::follow(
+            self.pos.0 as i32,
+            self.pos.1 as i32,
+            self.surface.w,
+            self.surface.h,
+        );
     }
 
     pub fn width(&self) -> u32 {
         self.surface.w.max(1) as u32
     }
 
-    /// 改显示宽度：重建 DIB，夹回屏幕内，写盘。
+    /// 改显示宽度：重建 DIB，夹回当前屏幕内，写盘。
     pub fn set_width(&mut self, w: u32) {
         let w = w.clamp(200, 900);
         if w == self.surface.w as u32 {
@@ -504,7 +708,7 @@ impl App {
         };
         self.surface = s;
 
-        let wa: RECT = work_area();
+        let wa = self.monitor_area();
         self.pos.0 = self
             .pos
             .0
@@ -517,7 +721,8 @@ impl App {
             .max(wa.top as f32);
 
         self.user.width = w;
-        self.save_user();
+        self.save_position();
+        self.dirty = true;
         self.paint();
     }
 
@@ -529,6 +734,7 @@ impl App {
     pub fn set_alpha(&mut self, a: u8) {
         self.user.alpha = a.clamp(40, 255);
         self.save_user();
+        self.dirty = true;
         self.paint();
     }
 
@@ -587,11 +793,29 @@ impl App {
     }
 
     fn save_user(&self) {
-        let _ = self.user.save(&self.cfg);
+        if let Err(e) = self.user.save(&self.cfg) {
+            if CONFIG_WARNED.set(()).is_ok() {
+                eprintln!(
+                    "[config] 保存设置失败 {}: {e}",
+                    self.cfg.join("settings.json").display()
+                );
+            }
+        }
     }
 
-    fn step_anim(&mut self, dt_ms: u32) {
+    fn save_position(&mut self) {
+        self.user.x = Some(self.pos.0.round() as i32);
+        self.user.y = Some(self.pos.1.round() as i32);
+        self.save_user();
+    }
+
+    pub fn save_on_exit(&mut self) {
+        self.save_position();
+    }
+
+    fn step_anim(&mut self, dt_ms: u32) -> bool {
         self.frame_ms += dt_ms;
+        let mut changed = false;
         let mut guard = 0;
         loop {
             let (delay, len) = match self.loaded.get(&self.cur_name) {
@@ -602,11 +826,11 @@ impl App {
                         (c.delays[self.frame], c.delays.len())
                     }
                 }
-                None => return,
+                None => return changed,
             };
             if self.frame >= len {
                 self.on_clip_end();
-                return;
+                return true;
             }
             if self.frame_ms < delay {
                 break;
@@ -618,19 +842,21 @@ impl App {
                 break;
             }
             self.frame += 1;
+            changed = true;
             if self.frame >= len {
                 self.on_clip_end();
-                return;
+                return true;
             }
             let next = self.stream.as_mut().and_then(|s| s.next_frame());
             match next {
                 Some(px) => self.px = px,
                 None => {
                     self.on_clip_end();
-                    return;
+                    return true;
                 }
             }
         }
+        changed
     }
 
     fn on_clip_end(&mut self) {
@@ -640,7 +866,15 @@ impl App {
             self.open(&name);
             return;
         }
-        self.advance_chain();
+        // 睡眠等 hold 事件：播完从头循环，直到收到退出事件
+        if self.phase == Phase::Event && self.event_hold {
+            let name = self.cur_name.clone();
+            self.open(&name);
+            return;
+        }
+        if !self.try_events(true) {
+            self.advance_chain();
+        }
     }
 
     fn step_physics(&mut self, dt: f32) {
@@ -651,7 +885,7 @@ impl App {
         self.pos.0 += self.vel.0 * dt;
         self.pos.1 += self.vel.1 * dt;
 
-        let wa: RECT = work_area();
+        let wa = self.monitor_area();
         let (left, top) = (wa.left as f32, wa.top as f32);
         let (right, bottom) = (wa.right as f32, wa.bottom as f32);
 
@@ -693,6 +927,7 @@ impl App {
         if on_ground && speed < 30.0 {
             self.vel = (0.0, 0.0);
             self.flying = false;
+            self.save_position();
             self.advance_chain();
         }
     }
@@ -709,17 +944,21 @@ impl App {
         self.flying = false;
         self.vel = (0.0, 0.0);
         self.move_plan = None;
+        self.event_hold = false;
         let pool = self.beh.drag.clone();
         if let Some(n) = pick(&mut self.rng, &pool) {
             self.open(&n);
             self.phase = Phase::Drag;
         }
+        self.dirty = true;
     }
 
     pub fn drag_move(&mut self) {
         let now = unsafe { GetTickCount() };
         let (cx, cy) = cursor();
-        let Some(d) = self.drag.as_mut() else { return };
+        let Some(d) = self.drag.as_mut() else {
+            return;
+        };
         self.pos = (cx as f32 - d.grab.0, cy as f32 - d.grab.1);
         d.trail.push((now, self.pos.0, self.pos.1));
         while let Some(&(t, _, _)) = d.trail.first() {
@@ -729,10 +968,14 @@ impl App {
                 break;
             }
         }
+        self.dirty = true;
     }
 
     pub fn end_drag(&mut self) {
-        let Some(d) = self.drag.take() else { return };
+        let Some(d) = self.drag.take() else {
+            return;
+        };
+        self.save_position();
 
         // 位移小、时间短 = 单击，播个回应动作
         let held = unsafe { GetTickCount() }.wrapping_sub(d.start_ms);
@@ -779,6 +1022,7 @@ impl App {
         } else {
             self.advance_chain();
         }
+        self.dirty = true;
     }
 
     pub fn is_dragging(&self) -> bool {
@@ -786,27 +1030,765 @@ impl App {
     }
 
     pub fn home(&mut self) {
-        let wa: RECT = work_area();
+        let wa = self.monitor_area();
         let (w, h) = (self.surface.w, self.surface.h);
         self.pos = ((wa.right - w - 48) as f32, (wa.bottom - h - 48) as f32);
         self.vel = (0.0, 0.0);
         self.flying = false;
         self.move_plan = None;
+        self.save_position();
+        self.dirty = true;
         self.paint();
     }
 
     pub fn reload(&mut self) -> Result<(), String> {
-        self.beh = Behavior::load(&self.assets.join("behaviors.json"))?;
+        let beh = Behavior::load(&self.assets.join("behaviors.json"))?;
+        let events = EventsFile::load(&self.assets.join("events.json")).unwrap_or_else(|e| {
+            eprintln!("[events] {e}，环境事件已关闭");
+            EventsFile::default()
+        });
+        self.beh = beh;
+        self.events = events;
+        self.sense.update_config(&self.events.sensors);
         self.anims = scan_anims(&self.assets)?;
         self.loaded.clear();
+        self.pending.clear();
+        self.event_hold = false;
+        self.apply_user();
+        self.validate_events();
         let name = self.cur_name.clone();
         if self.anims.contains_key(&name) {
             self.open(&name);
         } else {
             self.go_idle();
         }
+        self.dirty = true;
         self.paint();
         Ok(())
+    }
+
+    // ---- 环境事件 ----
+
+    pub fn set_debug(&mut self, on: bool) {
+        self.debug = on;
+    }
+
+    pub fn skip_startup_greeting(&mut self) {
+        self.startup_greet_at = None;
+    }
+
+    pub fn set_test_minutes(&mut self, minutes: Option<u32>) {
+        self.test_minutes = minutes;
+    }
+
+    pub fn toggles(&self) -> EventToggles {
+        EventToggles {
+            battery: self.user.evt_battery,
+            network: self.user.evt_network,
+            download: self.user.evt_download,
+            idle: self.user.evt_idle,
+            lock: self.user.evt_lock,
+            fullscreen: self.user.evt_fullscreen,
+            greet: self.user.greet_screen,
+            greet_startup: self.user.greet_startup,
+            bubble: self.user.bubble,
+            bubble_names: self.user.bubble_names,
+        }
+    }
+
+    pub fn set_toggle(&mut self, which: Toggle, on: bool) {
+        match which {
+            Toggle::Battery => self.user.evt_battery = on,
+            Toggle::Network => self.user.evt_network = on,
+            Toggle::Download => self.user.evt_download = on,
+            Toggle::Idle => self.user.evt_idle = on,
+            Toggle::Lock => self.user.evt_lock = on,
+            Toggle::Fullscreen => self.user.evt_fullscreen = on,
+            Toggle::Greet => self.user.greet_screen = on,
+            Toggle::GreetStartup => self.user.greet_startup = on,
+            Toggle::Bubble => self.user.bubble = on,
+            Toggle::BubbleNames => self.user.bubble_names = on,
+        }
+        if !self.user.bubble {
+            bubble::hide();
+            self.bubble_until = 0;
+        }
+        if !self.user.evt_fullscreen && self.fullscreen_hidden {
+            self.fullscreen_hidden = false;
+            if self.visible {
+                unsafe {
+                    ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+                }
+                self.dirty = true;
+                self.paint();
+            }
+        } else if self.user.evt_fullscreen && self.sense.is_fullscreen() {
+            self.set_fullscreen(true);
+        }
+        self.save_user();
+    }
+
+    pub fn poll_senses(&mut self) {
+        let now = unsafe { GetTickCount() };
+        let signals = self.sense.poll(now);
+        self.handle_signals(signals, now);
+        self.try_events(false);
+    }
+
+    pub fn poll_power(&mut self) {
+        let now = unsafe { GetTickCount() };
+        let signals = self.sense.poll_battery(now);
+        self.handle_signals(signals, now);
+        self.try_events(false);
+    }
+
+    pub fn on_display(&mut self, on: bool) {
+        let now = unsafe { GetTickCount() };
+        if !on {
+            let _ = self.sense.set_display(false, now);
+            self.pending.clear();
+            bubble::hide();
+            self.bubble_until = 0;
+            self.debug_log("display off");
+            return;
+        }
+        let away = self.sense.set_display(true, now);
+        self.debug_log(&format!("display on away={away:?}"));
+        // 熄屏期间传感器可能攒下了 idleSleep / 旧的下载事件，亮屏时先丢掉。
+        self.pending.clear();
+        if self.sense.is_locked() {
+            return;
+        }
+        self.wake_from_hold();
+        self.maybe_greet(GreetReason::Display, away, now, false);
+        self.try_events(false);
+    }
+
+    pub fn on_suspend(&mut self) {
+        let now = unsafe { GetTickCount() };
+        self.sense.on_suspend(now);
+        self.pending.clear();
+        bubble::hide();
+        self.bubble_until = 0;
+        self.debug_log("suspend");
+    }
+
+    pub fn on_resume(&mut self) {
+        let now = unsafe { GetTickCount() };
+        let away = self.sense.on_resume(now);
+        if self.wake_recent(now) {
+            return;
+        }
+        self.last_wake_at = Some(now);
+        self.pending.clear();
+        self.wake_from_hold();
+        // 问好和“恢复”动作可以同时发生：问好只负责气泡，动作仍按 events.json 播。
+        self.maybe_greet(GreetReason::Resume, away, now, false);
+        self.enqueue(EventKey::Resume, self.vars(now), now);
+        self.try_events(false);
+    }
+
+    pub fn on_session(&mut self, locked: bool) {
+        let now = unsafe { GetTickCount() };
+        if locked {
+            let _ = self.sense.set_locked(true, now);
+            // 锁屏期间不保留解锁/下载等旧事件，否则解锁后可能突然补播。
+            self.pending.clear();
+            self.event_hold = false;
+            self.phase = Phase::Idle;
+            bubble::hide();
+            self.bubble_until = 0;
+            self.enqueue(EventKey::SessionLock, self.vars(now), now);
+            self.try_events(true);
+            self.debug_log("session lock");
+            return;
+        }
+        let away = self.sense.set_locked(false, now);
+        if self.wake_recent(now) {
+            return;
+        }
+        self.last_wake_at = Some(now);
+        self.pending.clear();
+        self.wake_from_hold();
+        self.maybe_greet(GreetReason::Unlock, away, now, false);
+        self.enqueue(EventKey::SessionUnlock, self.vars(now), now);
+        self.debug_log("session unlock");
+        self.try_events(false);
+    }
+
+    /// 多屏/分辨率变化后，把宠物夹回当前显示器。
+    pub fn on_display_change(&mut self) {
+        self.clamp_to_monitor();
+        self.dirty = true;
+        self.paint();
+    }
+
+    fn wake_recent(&self, now: u32) -> bool {
+        self.last_wake_at
+            .map(|t| now.wrapping_sub(t) < 3_000)
+            .unwrap_or(false)
+    }
+
+    fn wake_from_hold(&mut self) {
+        if self.event_hold {
+            self.event_hold = false;
+            if self.phase == Phase::Event {
+                self.phase = Phase::Idle;
+            }
+            self.dirty = true;
+        }
+    }
+
+    fn vars(&self, now: u32) -> Vars {
+        let _ = now;
+        Vars {
+            time: Some(event::local_hhmm()),
+            ..Default::default()
+        }
+    }
+
+    fn handle_signals(&mut self, signals: Vec<Signal>, now: u32) {
+        for sig in signals {
+            match sig {
+                Signal::BatteryLow { pct } => {
+                    self.debug_log(&format!("battery low {pct}%"));
+                    self.enqueue(
+                        EventKey::BatteryLow,
+                        Vars {
+                            pct: Some(pct),
+                            ..self.vars(now)
+                        },
+                        now,
+                    );
+                }
+                Signal::BatteryCritical { pct } => {
+                    self.debug_log(&format!("battery critical {pct}%"));
+                    self.enqueue(
+                        EventKey::BatteryCritical,
+                        Vars {
+                            pct: Some(pct),
+                            ..self.vars(now)
+                        },
+                        now,
+                    );
+                }
+                Signal::BatteryCharging => {
+                    self.debug_log("battery charging");
+                    self.enqueue(EventKey::BatteryCharging, self.vars(now), now);
+                }
+                Signal::BatteryFull => {
+                    self.debug_log("battery full");
+                    self.enqueue(EventKey::BatteryFull, self.vars(now), now);
+                }
+                Signal::NetworkDown => {
+                    self.debug_log("network down");
+                    self.enqueue(EventKey::NetworkDown, self.vars(now), now);
+                }
+                Signal::NetworkUp => {
+                    self.debug_log("network up");
+                    self.enqueue(EventKey::NetworkUp, self.vars(now), now);
+                }
+                Signal::DownloadStart { name } => {
+                    self.debug_log(&format!("download start {name}"));
+                    self.enqueue(
+                        EventKey::DownloadStart,
+                        Vars {
+                            name: Some(self.display_name(name)),
+                            ..self.vars(now)
+                        },
+                        now,
+                    );
+                }
+                Signal::DownloadDone { name, size } => {
+                    self.debug_log(&format!("download done {name} {size}"));
+                    self.enqueue(
+                        EventKey::DownloadDone,
+                        Vars {
+                            name: Some(self.display_name(name)),
+                            size: Some(size),
+                            ..self.vars(now)
+                        },
+                        now,
+                    );
+                }
+                Signal::DownloadFailed { name } => {
+                    self.debug_log(&format!("download failed {name}"));
+                    self.enqueue(
+                        EventKey::DownloadFailed,
+                        Vars {
+                            name: Some(self.display_name(name)),
+                            ..self.vars(now)
+                        },
+                        now,
+                    );
+                }
+                Signal::IdleSleep => {
+                    self.debug_log("idle sleep");
+                    self.enqueue(EventKey::IdleSleep, self.vars(now), now);
+                }
+                Signal::IdleWake => {
+                    self.debug_log("idle wake");
+                    self.enqueue(EventKey::IdleWake, self.vars(now), now);
+                    if self.phase == Phase::Event && self.event_hold {
+                        self.event_hold = false;
+                        self.phase = Phase::Idle;
+                    }
+                    self.try_events(true);
+                }
+                Signal::FullscreenEnter => {
+                    self.debug_log("fullscreen enter");
+                    self.set_fullscreen(true);
+                }
+                Signal::FullscreenExit => {
+                    self.debug_log("fullscreen exit");
+                    self.set_fullscreen(false);
+                }
+            }
+        }
+    }
+
+    fn display_name(&self, name: String) -> String {
+        if self.user.bubble_names {
+            name
+        } else {
+            "文件".to_string()
+        }
+    }
+
+    fn enqueue(&mut self, key: EventKey, vars: Vars, now: u32) {
+        if !self.group_enabled(key) {
+            return;
+        }
+        let Some(rule) = self.events.rule(key).cloned() else {
+            return;
+        };
+        if !rule.enabled() {
+            return;
+        }
+        if self.pending.iter().any(|p| p.key == key) {
+            return;
+        }
+        if let Some(last) = self.last_fire.get(&key) {
+            if now.wrapping_sub(*last) < rule.cooldown_sec() * 1000 {
+                return;
+            }
+        }
+
+        let text = if self.user.bubble {
+            rule.bubble
+                .as_ref()
+                .map(|t| event::render(t, &vars))
+                .filter(|s| !s.trim().is_empty())
+        } else {
+            None
+        };
+        let action = self.pick_action(&rule.actions);
+        if text.is_none() && action.is_none() {
+            return;
+        }
+
+        self.debug_log(&format!("queue {}", key.as_str()));
+        self.pending.push(PendingEvent {
+            key,
+            action,
+            text,
+            priority: rule.priority(),
+            interrupt: rule.interrupt(),
+            hold: rule.hold(),
+            no_mirror: rule.no_mirror(),
+            at: now,
+        });
+        self.pending.sort_by_key(|p| std::cmp::Reverse(p.priority));
+    }
+
+    /// 只启动动作事件时返回 true；纯气泡事件处理完继续找下一个。
+    fn try_events(&mut self, allow_cut: bool) -> bool {
+        if self.fullscreen_hidden {
+            return false;
+        }
+        if !matches!(
+            self.phase,
+            Phase::Idle | Phase::Turn | Phase::Move | Phase::Category
+        ) {
+            return false;
+        }
+        let now = unsafe { GetTickCount() };
+        self.pending
+            .retain(|p| now.wrapping_sub(p.at) <= 15_000);
+
+        loop {
+            let idx = self
+                .pending
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.action.is_none() || allow_cut || p.interrupt)
+                .filter(|(_, p)| {
+                    p.action.is_none()
+                        || now.wrapping_sub(self.last_event_at)
+                            >= self.events.global_cooldown_sec * 1000
+                })
+                .max_by_key(|(_, p)| p.priority)
+                .map(|(i, _)| i);
+            let Some(idx) = idx else {
+                return false;
+            };
+            let p = self.pending.remove(idx);
+            self.last_fire.insert(p.key, now);
+
+            if let Some(text) = p.text.clone() {
+                self.show_bubble(&text, now);
+            }
+
+            if let Some(action) = p.action {
+                if p.no_mirror && self.facing == Facing::Right {
+                    self.facing = Facing::Left;
+                }
+                self.open(&action);
+                self.phase = Phase::Event;
+                self.event_hold = p.hold;
+                self.last_event_at = now;
+                self.dirty = true;
+                self.debug_log(&format!("start {} -> {}", p.key.as_str(), action));
+                return true;
+            }
+            self.debug_log(&format!("bubble {}", p.key.as_str()));
+        }
+    }
+
+    fn show_bubble(&mut self, text: &str, now: u32) {
+        if !self.user.bubble || !self.visible || self.fullscreen_hidden {
+            return;
+        }
+        bubble::show(
+            text,
+            self.pos.0 as i32,
+            self.pos.1 as i32,
+            self.surface.w,
+            self.surface.h,
+            &self.events.bubble_style,
+        );
+        self.bubble_until = now.wrapping_add(self.events.bubble_style.duration_ms());
+    }
+
+    fn maybe_greet(
+        &mut self,
+        reason: GreetReason,
+        away: Option<u32>,
+        now: u32,
+        force: bool,
+    ) -> bool {
+        if !force {
+            if reason_is_startup(reason) {
+                if !self.user.greet_startup {
+                    return false;
+                }
+            } else if !self.user.greet_screen {
+                return false;
+            }
+        }
+        if !self.sense.display_on() || self.sense.is_locked() {
+            return false;
+        }
+        if self.fullscreen_hidden || !self.visible {
+            return false;
+        }
+
+        let away = away.unwrap_or(0);
+        if !force {
+            if !matches!(reason, GreetReason::Startup | GreetReason::Simulated)
+                && away < self.events.greetings.min_away_sec
+            {
+                return false;
+            }
+            if !matches!(reason, GreetReason::Startup | GreetReason::Simulated)
+                && now.wrapping_sub(self.last_greet)
+                    < self.events.greetings.cooldown_sec * 1000
+            {
+                return false;
+            }
+        }
+
+        let minutes = self.test_minutes.unwrap_or_else(|| {
+            let (h, m) = event::local_time();
+            h * 60 + m
+        });
+        let g = &self.events.greetings;
+        let (texts, actions) = if away >= g.long_away_sec
+            && (!g.long_away_texts.is_empty() || !g.long_away_actions.is_empty())
+        {
+            (g.long_away_texts.clone(), g.long_away_actions.clone())
+        } else if let Some(slot) = g.slot_for(minutes) {
+            (slot.texts.clone(), slot.actions.clone())
+        } else {
+            (g.fallback_texts.clone(), g.fallback_actions.clone())
+        };
+
+        let text = if self.user.bubble {
+            pick(&mut self.rng, &texts)
+                .map(|t| event::render(&t, &self.vars(now)))
+                .filter(|s| !s.trim().is_empty())
+        } else {
+            None
+        };
+        let action = self.pick_action(&actions);
+        if text.is_none() && action.is_none() {
+            return false;
+        }
+
+        self.last_greet = now;
+        self.debug_log(&format!("greet {reason:?} away={away}s"));
+        self.pending.push(PendingEvent {
+            key: EventKey::Greeting,
+            action,
+            text,
+            priority: 20,
+            interrupt: true,
+            hold: false,
+            no_mirror: false,
+            at: now,
+        });
+        self.try_events(true);
+        true
+    }
+
+    fn pick_action(&mut self, actions: &[String]) -> Option<String> {
+        if actions.is_empty() {
+            return None;
+        }
+        let n = actions.len();
+        for _ in 0..n {
+            let name = &actions[(self.rng.next_u32() as usize) % n];
+            if self.anims.contains_key(name) {
+                return Some(name.clone());
+            }
+        }
+        None
+    }
+
+    fn group_enabled(&self, key: EventKey) -> bool {
+        match key {
+            EventKey::BatteryLow
+            | EventKey::BatteryCritical
+            | EventKey::BatteryCharging
+            | EventKey::BatteryFull => self.user.evt_battery,
+            EventKey::NetworkDown | EventKey::NetworkUp => self.user.evt_network,
+            EventKey::DownloadStart | EventKey::DownloadDone | EventKey::DownloadFailed => {
+                self.user.evt_download
+            }
+            EventKey::IdleSleep | EventKey::IdleWake => self.user.evt_idle,
+            EventKey::SessionLock | EventKey::SessionUnlock | EventKey::Resume => {
+                self.user.evt_lock
+            }
+            EventKey::Greeting => true,
+        }
+    }
+
+    fn set_fullscreen(&mut self, on: bool) {
+        if !self.user.evt_fullscreen {
+            return;
+        }
+        if on == self.fullscreen_hidden {
+            return;
+        }
+        self.fullscreen_hidden = on;
+        if on {
+            if self.visible {
+                unsafe {
+                    ShowWindow(self.hwnd, SW_HIDE);
+                }
+            }
+            bubble::hide();
+            self.bubble_until = 0;
+            self.debug_log("fullscreen hide");
+        } else {
+            if self.visible {
+                unsafe {
+                    ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+                }
+                self.dirty = true;
+                self.reassert_topmost();
+                self.paint();
+            }
+            self.try_events(false);
+            self.debug_log("fullscreen restore");
+        }
+    }
+
+    fn clamp_to_monitor(&mut self) {
+        let wa = self.monitor_area();
+        let (w, h) = (self.surface.w, self.surface.h);
+        self.pos.0 = self
+            .pos
+            .0
+            .clamp(wa.left as f32, (wa.right - w).max(wa.left) as f32);
+        self.pos.1 = self
+            .pos
+            .1
+            .clamp(wa.top as f32, (wa.bottom - h).max(wa.top) as f32);
+        self.save_position();
+    }
+
+    fn monitor_area(&self) -> RECT {
+        work_area_at(
+            self.pos.0 as i32 + self.surface.w / 2,
+            self.pos.1 as i32 + self.surface.h / 2,
+        )
+    }
+
+    fn reassert_topmost(&self) {
+        if !self.visible || self.fullscreen_hidden {
+            return;
+        }
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    fn validate_events(&self) {
+        for (key, rule) in &self.events.events {
+            self.validate_actions(&format!("events.{key}"), &rule.actions);
+        }
+        let g = &self.events.greetings;
+        self.validate_actions("greetings.longAway", &g.long_away_actions);
+        self.validate_actions("greetings.fallback", &g.fallback_actions);
+        for (i, slot) in g.slots.iter().enumerate() {
+            let name = format!("greetings.slots[{i}]");
+            self.validate_actions(&name, &slot.actions);
+            if event::parse_hm(&slot.from).is_none() || event::parse_hm(&slot.to).is_none() {
+                eprintln!("[events] {name}: from/to 不是合法的 HH:MM，已跳过");
+            }
+        }
+    }
+
+    fn validate_actions(&self, context: &str, actions: &[String]) {
+        for action in actions {
+            if !self.anims.contains_key(action) {
+                eprintln!("[events] {context}: 找不到动作「{action}」");
+            }
+        }
+    }
+
+    fn debug_log(&self, msg: &str) {
+        if !self.debug {
+            return;
+        }
+        eprintln!("[event] {msg}");
+        let path = EVENT_LOG.get_or_init(|| {
+            let primary = self.cfg.join("events.log");
+            if std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(true)
+                .open(&primary)
+                .is_ok()
+            {
+                primary
+            } else {
+                // 某些受限环境不允许程序往 %APPDATA% 新建文件；调试日志退到 TEMP。
+                let fallback = std::env::temp_dir().join("dsh-pet-rs-events.log");
+                eprintln!("[event] 日志回退到 {}", fallback.display());
+                fallback
+            }
+        });
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(mut f) => {
+                let _ = writeln!(f, "{msg}");
+            }
+            Err(e) => {
+                if EVENT_LOG_WARNED.set(()).is_ok() {
+                    eprintln!("[event] 写日志失败 {}: {e}", path.display());
+                }
+            }
+        }
+    }
+
+    // ---- 调试模拟 ----
+
+    pub fn simulate(&mut self, spec: &str) {
+        let now = unsafe { GetTickCount() };
+        for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let mut it = part.split(':');
+            let kind = it.next().unwrap_or("");
+            let a = it.next();
+            let b = it.next();
+            match kind {
+                "batteryLow" => self.handle_signals(
+                    vec![Signal::BatteryLow {
+                        pct: a.and_then(|s| s.parse().ok()).unwrap_or(15),
+                    }],
+                    now,
+                ),
+                "batteryCritical" => self.handle_signals(
+                    vec![Signal::BatteryCritical {
+                        pct: a.and_then(|s| s.parse().ok()).unwrap_or(8),
+                    }],
+                    now,
+                ),
+                "batteryCharging" => self.handle_signals(vec![Signal::BatteryCharging], now),
+                "batteryFull" => self.handle_signals(vec![Signal::BatteryFull], now),
+                "networkDown" => self.handle_signals(vec![Signal::NetworkDown], now),
+                "networkUp" => self.handle_signals(vec![Signal::NetworkUp], now),
+                "downloadStart" => self.handle_signals(
+                    vec![Signal::DownloadStart {
+                        name: a.unwrap_or("file.zip").to_string(),
+                    }],
+                    now,
+                ),
+                "downloadDone" => self.handle_signals(
+                    vec![Signal::DownloadDone {
+                        name: a.unwrap_or("file.zip").to_string(),
+                        size: b.and_then(|s| s.parse().ok()).unwrap_or(1_048_576),
+                    }],
+                    now,
+                ),
+                "downloadFailed" => self.handle_signals(
+                    vec![Signal::DownloadFailed {
+                        name: a.unwrap_or("file.zip").to_string(),
+                    }],
+                    now,
+                ),
+                "idleSleep" => self.handle_signals(vec![Signal::IdleSleep], now),
+                "idleWake" => self.handle_signals(vec![Signal::IdleWake], now),
+                "sessionLock" => self.on_session(true),
+                "sessionUnlock" => {
+                    self.last_wake_at = None;
+                    self.on_session(false);
+                }
+                "resume" => {
+                    self.last_wake_at = None;
+                    self.on_resume();
+                }
+                "fullscreenEnter" => self.set_fullscreen(true),
+                "fullscreenExit" => self.set_fullscreen(false),
+                "greet" => {
+                    // `greet:20:30` 里的时间被 split(':') 拆成了 a/b 两段
+                    let hm = match (a, b) {
+                        (Some(h), Some(m)) => format!("{h}:{m}"),
+                        (Some(h), None) => h.to_string(),
+                        _ => String::new(),
+                    };
+                    if let Some(minutes) = event::parse_hm(&hm) {
+                        self.test_minutes = Some(minutes);
+                    }
+                    self.maybe_greet(GreetReason::Simulated, None, now, true);
+                }
+                _ => eprintln!("[simulate] 未知事件 {kind}"),
+            }
+        }
+        self.try_events(true);
     }
 }
 
@@ -816,6 +1798,10 @@ fn pick(rng: &mut Rng, pool: &[String]) -> Option<String> {
     } else {
         Some(pool[(rng.next_u32() as usize) % pool.len()].clone())
     }
+}
+
+fn reason_is_startup(reason: GreetReason) -> bool {
+    matches!(reason, GreetReason::Startup | GreetReason::Simulated)
 }
 
 /// 扫素材目录：`assets/anims/*` 与 `assets/*`，同名以 anims 优先。
@@ -828,7 +1814,9 @@ fn scan_anims(dir: &std::path::Path) -> Result<HashMap<String, PathBuf>, String>
         vec![dir.to_path_buf()]
     };
     for d in dirs {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for e in rd.flatten() {
             let p = e.path();
             let ext = p
@@ -846,12 +1834,11 @@ fn scan_anims(dir: &std::path::Path) -> Result<HashMap<String, PathBuf>, String>
     Ok(out)
 }
 
-
 fn settings_path(dir: &std::path::Path) -> PathBuf {
     dir.join("settings.json")
 }
 
-/// 面板能改的所有东西，一次性存 `assets/settings.json`。
+/// 面板能改的所有东西，一次性存 `%APPDATA%\dsh-pet-rs\settings.json`。
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct UserSettings {
     #[serde(default = "d_width")]
@@ -866,6 +1853,30 @@ pub struct UserSettings {
     pub w_turn: Option<u32>,
     #[serde(default)]
     pub w_move: Option<u32>,
+    #[serde(default = "d_true")]
+    pub evt_battery: bool,
+    #[serde(default = "d_true")]
+    pub evt_network: bool,
+    #[serde(default = "d_true")]
+    pub evt_download: bool,
+    #[serde(default = "d_true")]
+    pub evt_idle: bool,
+    #[serde(default = "d_true")]
+    pub evt_lock: bool,
+    #[serde(default = "d_true")]
+    pub evt_fullscreen: bool,
+    #[serde(default = "d_true")]
+    pub greet_screen: bool,
+    #[serde(default = "d_true")]
+    pub greet_startup: bool,
+    #[serde(default = "d_true")]
+    pub bubble: bool,
+    #[serde(default = "d_true")]
+    pub bubble_names: bool,
+    #[serde(default)]
+    pub x: Option<i32>,
+    #[serde(default)]
+    pub y: Option<i32>,
 }
 
 fn d_width() -> u32 {
@@ -873,6 +1884,9 @@ fn d_width() -> u32 {
 }
 fn d_alpha() -> u8 {
     255
+}
+pub(crate) fn d_true() -> bool {
+    true
 }
 
 impl Default for UserSettings {
@@ -884,6 +1898,18 @@ impl Default for UserSettings {
             w_idle: None,
             w_turn: None,
             w_move: None,
+            evt_battery: true,
+            evt_network: true,
+            evt_download: true,
+            evt_idle: true,
+            evt_lock: true,
+            evt_fullscreen: true,
+            greet_screen: true,
+            greet_startup: true,
+            bubble: true,
+            bubble_names: true,
+            x: None,
+            y: None,
         }
     }
 }

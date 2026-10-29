@@ -176,8 +176,9 @@ impl Behavior {
     pub fn load(path: &std::path::Path) -> Result<Behavior, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
         // 允许 // 行注释，方便和原项目配置对照着改
-        let stripped = strip_line_comments(&text);
+        let stripped = strip_line_comments(text);
         serde_json::from_str(&stripped).map_err(|e| format!("{}: {e}", path.display()))
     }
 
@@ -198,7 +199,7 @@ impl Behavior {
 }
 
 /// 去掉 `//` 行注释（字符串内的不碰），让配置能带说明。
-fn strip_line_comments(src: &str) -> String {
+pub(crate) fn strip_line_comments(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     for line in src.lines() {
         let bytes: Vec<char> = line.chars().collect();

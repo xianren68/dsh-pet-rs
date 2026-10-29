@@ -3,12 +3,13 @@
 //! 走原生控件（STATIC / BUTTON / CHECKBOX / trackbar）而不是自绘——省掉一整套
 //! 控件逻辑，行为也符合系统习惯。所有改动即时作用到桌宠并写盘。
 //!
-//! 布局：三组滑块（大小 / 不透明度 / 三档权重）+ 两个开关 + 三个按钮。
+//! 布局：三组滑块（大小 / 不透明度 / 三档权重）+ 两个开关
+//! + 环境感知开关组 + 三个按钮。
 
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateFontW, DeleteObject, GetStockObject, SetBkMode, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
     COLOR_WINDOW, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, HFONT, OUT_DEFAULT_PRECIS,
@@ -22,6 +23,7 @@ use windows_sys::Win32::UI::Controls::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
+use crate::app::{EventToggles, Toggle};
 use crate::util::to_wide;
 
 // 控件 id
@@ -37,6 +39,16 @@ const ID_W_MOVE: i32 = 109;
 const ID_W_MOVE_LBL: i32 = 110;
 const ID_CHK_FIXED: i32 = 111;
 const ID_CHK_AUTORUN: i32 = 112;
+const ID_CHK_EVT_BATTERY: i32 = 113;
+const ID_CHK_EVT_NETWORK: i32 = 114;
+const ID_CHK_EVT_DOWNLOAD: i32 = 115;
+const ID_CHK_EVT_IDLE: i32 = 116;
+const ID_CHK_EVT_LOCK: i32 = 117;
+const ID_CHK_EVT_FULLSCREEN: i32 = 118;
+const ID_CHK_GREET: i32 = 119;
+const ID_CHK_GREET_STARTUP: i32 = 120;
+const ID_CHK_BUBBLE: i32 = 121;
+const ID_CHK_BUBBLE_NAMES: i32 = 122;
 const ID_HOME: i32 = 201;
 const ID_RELOAD: i32 = 202;
 const ID_CLOSE: i32 = 203;
@@ -69,6 +81,16 @@ struct Panel {
     w_move_lbl: HWND,
     chk_fixed: HWND,
     chk_autorun: HWND,
+    chk_evt_battery: HWND,
+    chk_evt_network: HWND,
+    chk_evt_download: HWND,
+    chk_evt_idle: HWND,
+    chk_evt_lock: HWND,
+    chk_evt_fullscreen: HWND,
+    chk_greet: HWND,
+    chk_greet_startup: HWND,
+    chk_bubble: HWND,
+    chk_bubble_names: HWND,
 }
 
 static mut PANEL: Option<Panel> = None;
@@ -90,8 +112,14 @@ fn pct_text(a: u32) -> String {
 pub fn show() {
     if let Some(p) = panel() {
         unsafe {
-            if let Some((w, a, (wi, wt, wm), fixed)) = crate::with_app(|app| {
-                (app.width(), app.alpha(), app.weights(), app.fixed())
+            if let Some((w, a, (wi, wt, wm), fixed, tg)) = crate::with_app(|app| {
+                (
+                    app.width(),
+                    app.alpha(),
+                    app.weights(),
+                    app.fixed(),
+                    app.toggles(),
+                )
             }) {
                 set_slider(p.size, w.clamp(MIN_W, MAX_W));
                 SetWindowTextW(p.size_lbl, to_wide(&size_text(w)).as_ptr());
@@ -103,12 +131,17 @@ pub fn show() {
                 SetWindowTextW(p.w_turn_lbl, to_wide(&wt.to_string()).as_ptr());
                 set_slider(p.w_move, wm);
                 SetWindowTextW(p.w_move_lbl, to_wide(&wm.to_string()).as_ptr());
-                SendMessageW(
-                    p.chk_fixed,
-                    BM_SETCHECK,
-                    if fixed { BST_CHECKED } else { 0 },
-                    0,
-                );
+                set_check(p.chk_fixed, fixed);
+                set_check(p.chk_evt_battery, tg.battery);
+                set_check(p.chk_evt_network, tg.network);
+                set_check(p.chk_evt_download, tg.download);
+                set_check(p.chk_evt_idle, tg.idle);
+                set_check(p.chk_evt_lock, tg.lock);
+                set_check(p.chk_evt_fullscreen, tg.fullscreen);
+                set_check(p.chk_greet, tg.greet);
+                set_check(p.chk_greet_startup, tg.greet_startup);
+                set_check(p.chk_bubble, tg.bubble);
+                set_check(p.chk_bubble_names, tg.bubble_names);
             }
             SendMessageW(
                 p.chk_autorun,
@@ -132,6 +165,21 @@ fn set_slider(h: HWND, v: u32) {
     unsafe {
         SendMessageW(h, TBM_SETPOS, 1, v as isize);
     }
+}
+
+fn set_check(h: HWND, on: bool) {
+    unsafe {
+        SendMessageW(h, BM_SETCHECK, if on { BST_CHECKED } else { 0 }, 0);
+    }
+}
+
+fn checked(h: HWND) -> bool {
+    unsafe { SendMessageW(h, BM_GETCHECK, 0, 0) as usize == BST_CHECKED }
+}
+
+fn apply_toggle(h: HWND, which: Toggle) {
+    let on = checked(h);
+    crate::with_app(|app| app.set_toggle(which, on));
 }
 
 fn create() {
@@ -161,12 +209,12 @@ fn create() {
         };
         RegisterClassExW(&wc);
 
-        // 客户区 420×442
+        // 客户区 420×606
         let mut rect = RECT {
             left: 0,
             top: 0,
             right: 420,
-            bottom: 442,
+            bottom: 606,
         };
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
         AdjustWindowRect(&mut rect, style, 0);
@@ -186,6 +234,10 @@ fn create() {
             null_mut(),
         );
         if hwnd.is_null() {
+            eprintln!(
+                "[settings] CreateWindowExW failed: {}",
+                GetLastError()
+            );
             return;
         }
 
@@ -249,10 +301,33 @@ fn create() {
         };
 
         // 初始值从 App 拿
-        let (w0, a0, (wi0, wt0, wm0), fixed0) = crate::with_app(|app| {
-            (app.width(), app.alpha(), app.weights(), app.fixed())
+        let (w0, a0, (wi0, wt0, wm0), fixed0, tg0) = crate::with_app(|app| {
+            (
+                app.width(),
+                app.alpha(),
+                app.weights(),
+                app.fixed(),
+                app.toggles(),
+            )
         })
-        .unwrap_or((640, 255, (10, 5, 5), false));
+        .unwrap_or((
+            640,
+            255,
+            (10, 5, 5),
+            false,
+            EventToggles {
+                battery: true,
+                network: true,
+                download: true,
+                idle: true,
+                lock: true,
+                fullscreen: true,
+                greet: true,
+                greet_startup: true,
+                bubble: true,
+                bubble_names: true,
+            },
+        ));
 
         // ---- 大小 ----
         mk("STATIC", "宠物大小", SS_LEFT, 20, 12, 200, 20, 0);
@@ -354,13 +429,135 @@ fn create() {
             SendMessageW(chk_autorun, BM_SETCHECK, BST_CHECKED, 0);
         }
 
+        // ---- 环境感知 ----
+        mk(
+            "BUTTON",
+            "环境感知（全部本地，不联网）",
+            BS_GROUPBOX as u32,
+            12,
+            382,
+            396,
+            168,
+            0,
+        );
+        let chk_evt_battery = mk(
+            "BUTTON",
+            "电量低/充满",
+            BS_AUTOCHECKBOX as u32,
+            24,
+            406,
+            180,
+            22,
+            ID_CHK_EVT_BATTERY,
+        );
+        let chk_evt_network = mk(
+            "BUTTON",
+            "网络断开/恢复",
+            BS_AUTOCHECKBOX as u32,
+            216,
+            406,
+            180,
+            22,
+            ID_CHK_EVT_NETWORK,
+        );
+        let chk_evt_download = mk(
+            "BUTTON",
+            "下载开始/完成",
+            BS_AUTOCHECKBOX as u32,
+            24,
+            432,
+            180,
+            22,
+            ID_CHK_EVT_DOWNLOAD,
+        );
+        let chk_evt_idle = mk(
+            "BUTTON",
+            "空闲时睡觉",
+            BS_AUTOCHECKBOX as u32,
+            216,
+            432,
+            180,
+            22,
+            ID_CHK_EVT_IDLE,
+        );
+        let chk_evt_lock = mk(
+            "BUTTON",
+            "锁屏/恢复",
+            BS_AUTOCHECKBOX as u32,
+            24,
+            458,
+            180,
+            22,
+            ID_CHK_EVT_LOCK,
+        );
+        let chk_evt_fullscreen = mk(
+            "BUTTON",
+            "全屏时隐藏",
+            BS_AUTOCHECKBOX as u32,
+            216,
+            458,
+            180,
+            22,
+            ID_CHK_EVT_FULLSCREEN,
+        );
+        let chk_greet = mk(
+            "BUTTON",
+            "点亮屏幕问好",
+            BS_AUTOCHECKBOX as u32,
+            24,
+            484,
+            180,
+            22,
+            ID_CHK_GREET,
+        );
+        let chk_greet_startup = mk(
+            "BUTTON",
+            "启动时问好",
+            BS_AUTOCHECKBOX as u32,
+            216,
+            484,
+            180,
+            22,
+            ID_CHK_GREET_STARTUP,
+        );
+        let chk_bubble = mk(
+            "BUTTON",
+            "显示气泡",
+            BS_AUTOCHECKBOX as u32,
+            24,
+            510,
+            180,
+            22,
+            ID_CHK_BUBBLE,
+        );
+        let chk_bubble_names = mk(
+            "BUTTON",
+            "气泡显示文件名",
+            BS_AUTOCHECKBOX as u32,
+            216,
+            510,
+            180,
+            22,
+            ID_CHK_BUBBLE_NAMES,
+        );
+        set_check(chk_evt_battery, tg0.battery);
+        set_check(chk_evt_network, tg0.network);
+        set_check(chk_evt_download, tg0.download);
+        set_check(chk_evt_idle, tg0.idle);
+        set_check(chk_evt_lock, tg0.lock);
+        set_check(chk_evt_fullscreen, tg0.fullscreen);
+        set_check(chk_greet, tg0.greet);
+        set_check(chk_greet_startup, tg0.greet_startup);
+        set_check(chk_bubble, tg0.bubble);
+        set_check(chk_bubble_names, tg0.bubble_names);
+
         // ---- 按钮 ----
         mk(
             "BUTTON",
             "回到角落",
             BS_PUSHBUTTON as u32,
             20,
-            392,
+            556,
             120,
             32,
             ID_HOME,
@@ -370,7 +567,7 @@ fn create() {
             "重载素材",
             BS_PUSHBUTTON as u32,
             150,
-            392,
+            556,
             120,
             32,
             ID_RELOAD,
@@ -380,7 +577,7 @@ fn create() {
             "关闭",
             BS_PUSHBUTTON as u32,
             280,
-            392,
+            556,
             120,
             32,
             ID_CLOSE,
@@ -401,6 +598,16 @@ fn create() {
             w_move_lbl,
             chk_fixed,
             chk_autorun,
+            chk_evt_battery,
+            chk_evt_network,
+            chk_evt_download,
+            chk_evt_idle,
+            chk_evt_lock,
+            chk_evt_fullscreen,
+            chk_greet,
+            chk_greet_startup,
+            chk_bubble,
+            chk_bubble_names,
         });
 
         set_slider(size, w0.clamp(MIN_W, MAX_W));
@@ -472,6 +679,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 0,
                             );
                         }
+                    }
+                }
+                ID_CHK_EVT_BATTERY
+                | ID_CHK_EVT_NETWORK
+                | ID_CHK_EVT_DOWNLOAD
+                | ID_CHK_EVT_IDLE
+                | ID_CHK_EVT_LOCK
+                | ID_CHK_EVT_FULLSCREEN
+                | ID_CHK_GREET
+                | ID_CHK_GREET_STARTUP
+                | ID_CHK_BUBBLE
+                | ID_CHK_BUBBLE_NAMES => {
+                    if let Some(p) = panel() {
+                        let (h, which) = match id {
+                            ID_CHK_EVT_BATTERY => (p.chk_evt_battery, Toggle::Battery),
+                            ID_CHK_EVT_NETWORK => (p.chk_evt_network, Toggle::Network),
+                            ID_CHK_EVT_DOWNLOAD => (p.chk_evt_download, Toggle::Download),
+                            ID_CHK_EVT_IDLE => (p.chk_evt_idle, Toggle::Idle),
+                            ID_CHK_EVT_LOCK => (p.chk_evt_lock, Toggle::Lock),
+                            ID_CHK_EVT_FULLSCREEN => (p.chk_evt_fullscreen, Toggle::Fullscreen),
+                            ID_CHK_GREET => (p.chk_greet, Toggle::Greet),
+                            ID_CHK_GREET_STARTUP => (p.chk_greet_startup, Toggle::GreetStartup),
+                            ID_CHK_BUBBLE => (p.chk_bubble, Toggle::Bubble),
+                            _ => (p.chk_bubble_names, Toggle::BubbleNames),
+                        };
+                        apply_toggle(h, which);
                     }
                 }
                 ID_HOME => {

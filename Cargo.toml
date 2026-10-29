@@ -1,8 +1,8 @@
 [package]
 name = "dsh-pet-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "极简原生桌宠（Win32 分层窗 + APNG 帧动画）"
+description = "极简原生桌宠（Win32 分层窗 + 动画 WebP + 本地环境感知）"
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["png", "gif"] }
@@ -21,6 +21,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
     "Win32_System_Registry",
+    "Win32_System_Power",
+    "Win32_Networking_WinInet",
+    "Win32_System_RemoteDesktop",
 ] }
 
 [build-dependencies]

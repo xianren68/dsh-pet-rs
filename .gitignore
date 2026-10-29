@@ -1,5 +1,6 @@
 /target
 /dist
+/dist-win7/
 /assets/anims/
 /assets/icon.ico
 /assets/settings.json
@@ -7,3 +8,4 @@
 *.clipcache
 *.webm
 *.png
+/extras/
