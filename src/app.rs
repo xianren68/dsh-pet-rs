@@ -170,6 +170,8 @@ pub struct App {
     holidays: Option<crate::holiday::Holidays>,
     /// 下次重试读缓存的时间点
     holiday_retry_at: u32,
+    /// 调试开关：启动时读一次 `DSH_DUMP_PET`，避免每帧都查环境变量
+    dump_pet: bool,
     last_wake_at: Option<u32>,
     fullscreen_hidden: bool,
     bubble_until: u32,
@@ -313,6 +315,7 @@ impl App {
                 crate::holiday::load(&cfg, st.wYear as i32)
             },
             holiday_retry_at: now.wrapping_add(8_000),
+            dump_pet: std::env::var_os("DSH_DUMP_PET").is_some(),
             last_wake_at: None,
             fullscreen_hidden: false,
             bubble_until: 0,
@@ -812,7 +815,7 @@ impl App {
             self.user.alpha,
         );
         // 调试：每隔 20 帧把实际渲染结果存一张，用来判断花屏是数据问题还是窗口问题
-        if self.frame % 20 == 0 && std::env::var_os("DSH_DUMP_PET").is_some() {
+        if self.dump_pet && self.frame % 20 == 0 {
             let (w, h) = (dw as u32, dh as u32);
             let px = self.surface.pixels();
             let mut img = image::RgbaImage::new(w, h);
