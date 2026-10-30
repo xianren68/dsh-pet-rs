@@ -11,7 +11,9 @@ mod behavior;
 mod bubble;
 mod clip;
 mod event;
+mod holiday;
 mod icon;
+mod salary;
 mod scale;
 mod sense;
 mod settings;
@@ -379,8 +381,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
 
         WM_RBUTTONUP => {
-            let cats = with_app(|app| app.categories()).unwrap_or_default();
-            let cmd = tray::popup_pet(hwnd, &cats);
+            let (cats, salary) =
+                with_app(|app| (app.categories(), app.salary_on())).unwrap_or_default();
+            let cmd = tray::popup_pet(hwnd, &cats, salary);
             if cmd > 0 {
                 let flat: Vec<String> = cats.iter().flat_map(|(_, v)| v.clone()).collect();
                 handle_command(hwnd, cmd, &flat);
@@ -492,6 +495,9 @@ fn handle_command(hwnd: HWND, cmd: u32, flat: &[String]) {
         }
         tray::CMD_SETTINGS => {
             settings::show();
+        }
+        tray::CMD_SALARY => {
+            with_app(|app| app.count_salary());
         }
         tray::CMD_EXIT => unsafe {
             DestroyWindow(hwnd);

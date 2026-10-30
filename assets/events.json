@@ -15,16 +15,37 @@
   // 气泡外观。字号、圆角、内边距、最大宽度都是 96 DPI 下的逻辑值，
   // 实际会按系统 DPI 缩放；颜色写 #RRGGBB，alpha 是整体不透明度。
   "bubbleStyle": {
-    "fontFamily": "Microsoft YaHei UI",
-    "fontSize": 16,
+    // 圆体（YouYuan = 幼圆），比雅黑更接近素材里那种手绘气泡的调子
+    "fontFamily": "YouYuan",
+    "fontSize": 17,
     "fontWeight": 400,
-    "textColor": "#FFFFFF",
-    "backgroundColor": "#2B2B2B",
-    "alpha": 240,
-    "cornerRadius": 7,
-    "padding": 12,
-    "maxWidth": 320,
+    "textColor": "#4A5563",
+    "backgroundColor": "#FBFAF6",
+    // 浅色底必须有描边，否则在浅色桌面上完全看不见
+    "borderColor": "#B9B2A4",
+    "borderWidth": 2,
+    "alpha": 250,
+    "cornerRadius": 14,
+    "padding": 11,
+    "maxWidth": 300,
     "durationMs": 4000
+  },
+
+  // ---- 数工资 ----
+  // sayAtRatio：动作播到几成时才报数。1.0 = 播完才说。
+  // 数钱动作在中后段收尾，0.72 差不多是"数完抬头"的那一刻。
+  // texts 里 {amount} 会替换成金额；三个 key 分别对应
+  // 上班前 / 上班中 / 下班后。
+  "salary": {
+    "sayAtRatio": 0.72,
+    // 只报今天赚了多少。{amount} 今日金额，{daily} 日薪，
+    // {days} 当月工作日数 —— 后面两个留着，想显示时往文案里加就行。
+    "texts": {
+      "before": "还没上班呢",
+      "during": "今天赚了 ¥{amount}",
+      "after": "下班啦，赚了 ¥{amount}",
+      "rest": "今天休息，不打工"
+    }
   },
 
   "sensors": {

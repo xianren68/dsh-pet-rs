@@ -22,6 +22,7 @@ pub const CMD_HOME: u32 = 10001;
 pub const CMD_RELOAD: u32 = 10002;
 pub const CMD_EXIT: u32 = 10003;
 pub const CMD_SETTINGS: u32 = 10004;
+pub const CMD_SALARY: u32 = 10005;
 
 pub struct Tray {
     data: NOTIFYICONDATAW,
@@ -105,7 +106,10 @@ pub fn popup_tray(hwnd: HWND) -> u32 {
 }
 
 /// 悬浮菜单：分类子菜单 + 固定项。返回值的 1..=N 对应 `cats` 按序平铺后的下标+1。
-pub fn popup_pet(hwnd: HWND, cats: &[(String, Vec<String>)]) -> u32 {
+///
+/// `salary` 为真时在固定项上方插一条「数工资」—— 开关没开就不显示，
+/// 免得让人点了一个什么都不做的菜单项。
+pub fn popup_pet(hwnd: HWND, cats: &[(String, Vec<String>)], salary: bool) -> u32 {
     unsafe {
         let menu = CreatePopupMenu();
         let mut flat = 0u32;
@@ -123,6 +127,11 @@ pub fn popup_pet(hwnd: HWND, cats: &[(String, Vec<String>)]) -> u32 {
             AppendMenuW(menu, MF_POPUP, sub as usize, w.as_ptr());
         }
         AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+        if salary {
+            let w = to_wide("数工资");
+            AppendMenuW(menu, MF_STRING, CMD_SALARY as usize, w.as_ptr());
+            AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+        }
         for (label, id) in [
             ("设置…", CMD_SETTINGS),
             ("回到角落", CMD_HOME),

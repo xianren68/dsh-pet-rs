@@ -49,6 +49,12 @@ const ID_CHK_GREET: i32 = 119;
 const ID_CHK_GREET_STARTUP: i32 = 120;
 const ID_CHK_BUBBLE: i32 = 121;
 const ID_CHK_BUBBLE_NAMES: i32 = 122;
+const ID_CHK_SALARY: i32 = 130;
+const ID_ED_WORK_START: i32 = 131;
+const ID_ED_WORK_END: i32 = 132;
+const ID_ED_LUNCH_START: i32 = 133;
+const ID_ED_LUNCH_END: i32 = 134;
+const ID_ED_SALARY_MONTH: i32 = 135;
 const ID_HOME: i32 = 201;
 const ID_RELOAD: i32 = 202;
 const ID_CLOSE: i32 = 203;
@@ -91,6 +97,12 @@ struct Panel {
     chk_greet_startup: HWND,
     chk_bubble: HWND,
     chk_bubble_names: HWND,
+    chk_salary: HWND,
+    ed_work_start: HWND,
+    ed_work_end: HWND,
+    ed_lunch_start: HWND,
+    ed_lunch_end: HWND,
+    ed_salary_month: HWND,
 }
 
 static mut PANEL: Option<Panel> = None;
@@ -177,6 +189,33 @@ fn checked(h: HWND) -> bool {
     unsafe { SendMessageW(h, BM_GETCHECK, 0, 0) as usize == BST_CHECKED }
 }
 
+/// 读面板上五个输入框，写回配置。输入框失焦（EN_KILLFOCUS）时调用。
+///
+/// 月薪解析失败就当没改（保留 8000 的兜底），不弹错 —— 输到一半的 `9` 也算合法。
+fn save_salary_edits() {
+    let Some(p) = panel() else {
+        return;
+    };
+    let get = |h: HWND| -> String {
+        let mut buf = [0u16; 32];
+        let n = unsafe { GetWindowTextW(h, buf.as_mut_ptr(), buf.len() as i32) };
+        if n <= 0 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&buf[..n as usize])
+    };
+    let on = unsafe { SendMessageW(p.chk_salary, BM_GETCHECK, 0, 0) as usize == BST_CHECKED };
+    let ws = get(p.ed_work_start).trim().to_string();
+    let we = get(p.ed_work_end).trim().to_string();
+    let ls = get(p.ed_lunch_start).trim().to_string();
+    let le = get(p.ed_lunch_end).trim().to_string();
+    let month = get(p.ed_salary_month)
+        .trim()
+        .parse::<u32>()
+        .unwrap_or_else(|_| crate::app::UserSettings::default().salary_month);
+    crate::with_app(|app| app.set_salary(on, ws, we, ls, le, month));
+}
+
 fn apply_toggle(h: HWND, which: Toggle) {
     let on = checked(h);
     crate::with_app(|app| app.set_toggle(which, on));
@@ -209,12 +248,12 @@ fn create() {
         };
         RegisterClassExW(&wc);
 
-        // 客户区 420×606
+        // 客户区 420×772
         let mut rect = RECT {
             left: 0,
             top: 0,
             right: 420,
-            bottom: 606,
+            bottom: 772,
         };
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
         AdjustWindowRect(&mut rect, style, 0);
@@ -551,13 +590,70 @@ fn create() {
         set_check(chk_bubble, tg0.bubble);
         set_check(chk_bubble_names, tg0.bubble_names);
 
+        // ---- 数工资 ----
+        mk(
+            "BUTTON",
+            "数工资（按今天已工作比例折算）",
+            BS_GROUPBOX as u32,
+            12,
+            558,
+            396,
+            150,
+            0,
+        );
+        let chk_salary = mk(
+            "BUTTON",
+            "启用（右键菜单出现「数工资」）",
+            BS_AUTOCHECKBOX as u32,
+            24,
+            582,
+            240,
+            22,
+            ID_CHK_SALARY,
+        );
+        // 原生 EDIT：样式里 0x0080 是 ES_AUTOHSCROLL（windows-sys 没导出）
+        let ed_style = WS_BORDER | WS_TABSTOP | 0x0080;
+        mk("STATIC", "上班", SS_LEFT, 24, 612, 32, 20, 0);
+        let ed_work_start = mk("EDIT", "", ed_style, 58, 610, 56, 22, ID_ED_WORK_START);
+        mk("STATIC", "下班", SS_LEFT, 124, 612, 32, 20, 0);
+        let ed_work_end = mk("EDIT", "", ed_style, 158, 610, 56, 22, ID_ED_WORK_END);
+        mk("STATIC", "午休", SS_LEFT, 224, 612, 32, 20, 0);
+        let ed_lunch_start = mk("EDIT", "", ed_style, 258, 610, 56, 22, ID_ED_LUNCH_START);
+        mk("STATIC", "至", SS_LEFT, 318, 612, 16, 20, 0);
+        let ed_lunch_end = mk("EDIT", "", ed_style, 336, 610, 56, 22, ID_ED_LUNCH_END);
+        mk("STATIC", "月薪", SS_LEFT, 24, 644, 32, 20, 0);
+        let ed_salary_month = mk("EDIT", "", ed_style, 58, 642, 68, 22, ID_ED_SALARY_MONTH);
+        mk(
+            "STATIC",
+            "元/月，按 21.75 个计薪日折算",
+            SS_LEFT,
+            132,
+            644,
+            250,
+            20,
+            0,
+        );
+
+        // 数工资的初始值（控件建完才能填）
+        let (sal_on, ws, we, ls, le, month) =
+            crate::with_app(|app| app.salary_cfg()).unwrap_or_default();
+        set_check(chk_salary, sal_on);
+        let put = |h: HWND, s: &str| {
+            SetWindowTextW(h, to_wide(s).as_ptr());
+        };
+        put(ed_work_start, &ws);
+        put(ed_work_end, &we);
+        put(ed_lunch_start, &ls);
+        put(ed_lunch_end, &le);
+        put(ed_salary_month, &month.to_string());
+
         // ---- 按钮 ----
         mk(
             "BUTTON",
             "回到角落",
             BS_PUSHBUTTON as u32,
             20,
-            556,
+            716,
             120,
             32,
             ID_HOME,
@@ -567,7 +663,7 @@ fn create() {
             "重载素材",
             BS_PUSHBUTTON as u32,
             150,
-            556,
+            716,
             120,
             32,
             ID_RELOAD,
@@ -577,7 +673,7 @@ fn create() {
             "关闭",
             BS_PUSHBUTTON as u32,
             280,
-            556,
+            716,
             120,
             32,
             ID_CLOSE,
@@ -608,6 +704,12 @@ fn create() {
             chk_greet_startup,
             chk_bubble,
             chk_bubble_names,
+            chk_salary,
+            ed_work_start,
+            ed_work_end,
+            ed_lunch_start,
+            ed_lunch_end,
+            ed_salary_month,
         });
 
         set_slider(size, w0.clamp(MIN_W, MAX_W));
@@ -657,6 +759,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
         WM_COMMAND => {
             let id = (wparam & 0xffff) as i32;
+            let code = ((wparam >> 16) & 0xffff) as u32;
+            // EN_KILLFOCUS = 0x0200：离开输入框才写盘，不然每敲一个字都会落一次文件
+            if code == 0x0200
+                && matches!(
+                    id,
+                    ID_ED_WORK_START
+                        | ID_ED_WORK_END
+                        | ID_ED_LUNCH_START
+                        | ID_ED_LUNCH_END
+                        | ID_ED_SALARY_MONTH
+                )
+            {
+                save_salary_edits();
+                return 0;
+            }
             match id {
                 ID_CHK_FIXED => {
                     if let Some(p) = panel() {
@@ -680,6 +797,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             );
                         }
                     }
+                }
+                ID_CHK_SALARY => {
+                    save_salary_edits();
                 }
                 ID_CHK_EVT_BATTERY
                 | ID_CHK_EVT_NETWORK

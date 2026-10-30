@@ -81,15 +81,32 @@ impl Surface {
     }
 
     /// 把一整帧 BGRA（`0xAARRGGBB`，小端）拷进 DIB。
+    ///
+    /// **做 alpha 预乘**。`UpdateLayeredWindow` 配 `AC_SRC_ALPHA` 要求位图是预乘的，
+    /// 而 WebP 解出来的是非预乘——直接把非预乘数据贴上去，半透明边缘的 RGB 没乘
+    /// alpha 却被当成已乘，边缘会偏亮发白（深色桌面上就是一圈白斑/白块）。
     pub fn upload(&mut self, frame: &[u32]) {
         let n = (self.w * self.h).max(0) as usize;
         let n = n.min(frame.len());
         unsafe {
-            std::ptr::copy_nonoverlapping(frame.as_ptr(), self.bits, n);
+            for i in 0..n {
+                let p = frame[i];
+                let a = p >> 24;
+                *self.bits.add(i) = if a == 255 {
+                    p
+                } else if a == 0 {
+                    0
+                } else {
+                    let r = ((p >> 16) & 0xFF) * a / 255;
+                    let g = ((p >> 8) & 0xFF) * a / 255;
+                    let b = (p & 0xFF) * a / 255;
+                    (a << 24) | (r << 16) | (g << 8) | b
+                };
+            }
         }
     }
 
-    /// 水平镜像后写入 DIB（朝右时用；素材原生朝左）。
+    /// 水平镜像后写入 DIB（朝右时用；素材原生朝左）。同样做预乘。
     ///
     /// 只动像素不做预翻转副本：640×360 一行 2.5KB，整帧不到 1ms。
     pub fn upload_flipped(&mut self, frame: &[u32]) {
@@ -110,7 +127,18 @@ impl Surface {
                 let len = end - row;
                 let dst = self.bits.add(row);
                 for x in 0..len {
-                    *dst.add(x) = frame[row + len - 1 - x];
+                    let p = frame[row + len - 1 - x];
+                    let a = p >> 24;
+                    *dst.add(x) = if a == 255 {
+                        p
+                    } else if a == 0 {
+                        0
+                    } else {
+                        let r = ((p >> 16) & 0xFF) * a / 255;
+                        let g = ((p >> 8) & 0xFF) * a / 255;
+                        let b = (p & 0xFF) * a / 255;
+                        (a << 24) | (r << 16) | (g << 8) | b
+                    };
                 }
             }
         }

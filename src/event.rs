@@ -109,6 +109,10 @@ pub struct BubbleStyle {
     pub text_color: String,
     /// 背景颜色，`#RRGGBB`。
     pub background_color: String,
+    /// 描边颜色，`#RRGGBB`。浅色底必须靠描边才在浅色桌面上有轮廓。
+    pub border_color: String,
+    /// 描边宽度（96 DPI 像素），0 = 不描边。
+    pub border_width: i32,
     /// 整体不透明度，0–255。
     pub alpha: u32,
     /// 圆角半径，0 = 直角。
@@ -129,6 +133,8 @@ impl Default for BubbleStyle {
             font_weight: 400,
             text_color: "#FFFFFF".to_string(),
             background_color: "#2B2B2B".to_string(),
+            border_color: "#111111".to_string(),
+            border_width: 0,
             alpha: 240,
             corner_radius: 7,
             padding: 12,
@@ -327,6 +333,55 @@ impl GreetingsConfig {
     }
 }
 
+/// 数工资的报数时机与文案。放在 events.json 里，改完右键「重载素材」生效。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SalaryConfig {
+    /// 动作播到几成才报数，0.0~1.0。1.0 = 播完才说。
+    pub say_at_ratio: f32,
+    pub texts: SalaryTexts,
+}
+
+impl Default for SalaryConfig {
+    fn default() -> Self {
+        Self {
+            say_at_ratio: 0.72,
+            texts: SalaryTexts::default(),
+        }
+    }
+}
+
+impl SalaryConfig {
+    /// 按时长算出该延迟多少毫秒。夹在 0 和整段时长之间，防止配置写飞。
+    pub fn delay_ms(&self, total_ms: u32) -> u32 {
+        let r = self.say_at_ratio.clamp(0.0, 1.0);
+        (total_ms as f32 * r) as u32
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SalaryTexts {
+    /// 还没到上班时间
+    pub before: String,
+    /// 上班中 / 下班后共用 `{amount}` 占位
+    pub during: String,
+    pub after: String,
+    /// 今天是休息日（周末 / 法定假日）时说的话
+    pub rest: String,
+}
+
+impl Default for SalaryTexts {
+    fn default() -> Self {
+        Self {
+            before: "还没上班呢".to_string(),
+            during: "今天赚了 ¥{amount}".to_string(),
+            after: "下班啦，赚了 ¥{amount}".to_string(),
+            rest: "今天休息，不打工".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct EventsFile {
@@ -336,6 +391,7 @@ pub struct EventsFile {
     pub bubble_style: BubbleStyle,
     pub events: HashMap<String, EventRule>,
     pub greetings: GreetingsConfig,
+    pub salary: SalaryConfig,
 }
 
 impl Default for EventsFile {
@@ -346,6 +402,7 @@ impl Default for EventsFile {
             bubble_style: BubbleStyle::default(),
             events: HashMap::new(),
             greetings: GreetingsConfig::default(),
+            salary: SalaryConfig::default(),
         }
     }
 }

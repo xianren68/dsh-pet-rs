@@ -9,3 +9,7 @@
 *.webm
 *.png
 /extras/
+# 下载的 ffmpeg 完整包，315 MB，只在本机用来转素材
+/tools/ffmpeg-*/
+# 新素材的源文件（视频、参考图），只在本地留着，不进仓库
+/assets/newpet/

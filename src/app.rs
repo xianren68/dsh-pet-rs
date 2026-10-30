@@ -161,6 +161,15 @@ pub struct App {
     event_hold: bool,
     last_greet: u32,
     startup_greet_at: Option<u32>,
+    /// 数工资的报数时刻：播到动作的 `sayAtRatio` 处才弹气泡，
+    /// 免得数钱还没数完就先把结果念出来了。
+    salary_at: Option<u32>,
+    /// 配置目录（节假日缓存也放这儿）
+    cfg_dir: std::path::PathBuf,
+    /// 当年的节假日表。拿不到就是 None，日薪回落到 21.75。
+    holidays: Option<crate::holiday::Holidays>,
+    /// 下次重试读缓存的时间点
+    holiday_retry_at: u32,
     last_wake_at: Option<u32>,
     fullscreen_hidden: bool,
     bubble_until: u32,
@@ -297,6 +306,13 @@ impl App {
             event_hold: false,
             last_greet: 0,
             startup_greet_at,
+            salary_at: None,
+            cfg_dir: cfg.clone(),
+            holidays: {
+                let st = crate::holiday::today();
+                crate::holiday::load(&cfg, st.wYear as i32)
+            },
+            holiday_retry_at: now.wrapping_add(8_000),
             last_wake_at: None,
             fullscreen_hidden: false,
             bubble_until: 0,
@@ -313,6 +329,12 @@ impl App {
         };
         app.apply_user();
         app.validate_events();
+
+        // 没有节假日缓存就后台拉一次（一年一条，拉到就再不用联网）
+        if app.holidays.is_none() {
+            let year = crate::holiday::today().wYear as i32;
+            crate::holiday::fetch_async(app.cfg.clone(), year);
+        }
 
         let name = app.cur_name.clone();
         app.open(&name);
@@ -395,6 +417,68 @@ impl App {
         }
     }
 
+    /// 面板初始化时读一次工资配置：开关 + 四个时间 + 月薪。
+    pub fn salary_cfg(&self) -> (bool, String, String, String, String, u32) {
+        (
+            self.user.salary,
+            self.user.work_start.clone(),
+            self.user.work_end.clone(),
+            self.user.lunch_start.clone(),
+            self.user.lunch_end.clone(),
+            self.user.salary_month,
+        )
+    }
+
+    /// 数工资开关是否打开（右键菜单据此决定要不要显示那条菜单项）。
+    pub fn salary_on(&self) -> bool {
+        self.user.salary
+    }
+
+    /// 数工资：播一次「数工资」动作。报数由 `open` 里的钩子负责 ——
+    /// 这样不管是右键点的还是随机抽到的，都会报一次，不用两处维护。
+    pub fn count_salary(&mut self) {
+        if self.user.salary && self.anims.contains_key("数工资") {
+            self.play_name("数工资");
+        }
+    }
+
+    /// 当月实际工作日数。有节假日表就按真实日历算，否则回落到 21.75。
+    fn salary_workdays(&self) -> f32 {
+        if let Some(h) = &self.holidays {
+            let st = crate::holiday::today();
+            let n = h.workdays_in_month(st.wYear as i32, st.wMonth as u32, &st);
+            if n > 0 {
+                return n as f32;
+            }
+        }
+        crate::holiday::FALLBACK_WORKDAYS
+    }
+
+    /// 把今天赚到的数字报在气泡里。开关没开、配置不合法都静默跳过。
+    fn report_salary(&mut self, now: u32) {
+        if !self.user.salary {
+            return;
+        }
+        // 周末 / 法定假日点它就别算钱了 —— 人没上班，算出来是假的
+        if let Some(h) = &self.holidays {
+            let st = crate::holiday::today();
+            if !h.is_workday(&st) {
+                let text = self.events.salary.texts.rest.clone();
+                self.show_bubble(&text, now);
+                self.debug_log("salary: rest day");
+                return;
+            }
+        }
+        let workdays = self.salary_workdays();
+        let Some(p) = crate::salary::progress(&self.user, workdays) else {
+            eprintln!("[salary] 上下班 / 午休时间不合法，跳过");
+            return;
+        };
+        let text = crate::salary::bubble_text(&p, &self.events.salary.texts);
+        self.show_bubble(&text, now);
+        self.debug_log(&format!("salary {text}"));
+    }
+
     // ---- 播放 ----
 
     fn ensure(&mut self, name: &str) -> Result<(), String> {
@@ -432,6 +516,15 @@ impl App {
                     self.frame = 0;
                     self.frame_ms = 0;
                     self.move_plan = None;
+                    // 「数工资」是一段会说话的动作：不论从哪条路径播到它都要报数。
+                    // 但不立刻说 —— 挂一个时刻，等动作推进到 sayAtRatio 再弹，
+                    // 否则钱还没数完就先把结果念出来了。
+                    if name == "数工资" {
+                        let total = self.loaded.get(name).map(|c| c.total_ms()).unwrap_or(0);
+                        let delay = self.events.salary.delay_ms(total);
+                        let now = unsafe { GetTickCount() };
+                        self.salary_at = Some(now.wrapping_add(delay));
+                    }
                 }
                 None => eprintln!("[clip] {name} 解不出第一帧"),
             },
@@ -622,6 +715,27 @@ impl App {
             }
         }
 
+        // 数工资：等到动作推进到设定比例，再报数
+        if let Some(at) = self.salary_at {
+            if now >= at {
+                self.salary_at = None;
+                self.report_salary(now);
+                changed = true;
+            }
+        }
+
+        // 节假日缓存是后台线程拉的，这里定期看看文件到位没有
+        if self.holidays.is_none() && now >= self.holiday_retry_at {
+            let st = crate::holiday::today();
+            match crate::holiday::load(&self.cfg_dir, st.wYear as i32) {
+                Some(h) => {
+                    self.holidays = Some(h);
+                    self.debug_log("holidays loaded");
+                }
+                None => self.holiday_retry_at = now.wrapping_add(60_000),
+            }
+        }
+
         self.try_events(false);
 
         if self.dirty || changed {
@@ -664,6 +778,20 @@ impl App {
             .map(|c| (c.w as usize, c.h as usize))
             .unwrap_or((dw, dh));
 
+        // 兜底：先把表面抹成全透明。正常情况下 upload 会整块覆盖，
+        // 但万一某帧解出来的像素数少于画布（解码异常），剩下的像素
+        // 会保留上一帧内容，表现为画面上零散的方块残留。
+        self.surface.pixels().fill(0);
+        if self.px.len() < dw * dh {
+            eprintln!(
+                "[paint] 帧不完整 {} < {} ({}x{})",
+                self.px.len(),
+                dw * dh,
+                dw,
+                dh
+            );
+        }
+
         if sw == dw && sh == dh {
             // 原尺寸直传，零开销（默认就是这条路径）
             match self.facing {
@@ -683,6 +811,24 @@ impl App {
             self.pos.1 as i32,
             self.user.alpha,
         );
+        // 调试：每隔 20 帧把实际渲染结果存一张，用来判断花屏是数据问题还是窗口问题
+        if self.frame % 20 == 0 && std::env::var_os("DSH_DUMP_PET").is_some() {
+            let (w, h) = (dw as u32, dh as u32);
+            let px = self.surface.pixels();
+            let mut img = image::RgbaImage::new(w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    let p = px[(y * w + x) as usize];
+                    img.put_pixel(
+                        x,
+                        y,
+                        image::Rgba([(p >> 16) as u8, (p >> 8) as u8, p as u8, (p >> 24) as u8]),
+                    );
+                }
+            }
+            let path = std::env::temp_dir().join(format!("pet_dump_{:03}.png", self.frame));
+            let _ = img.save(&path);
+        }
         self.dirty = false;
         bubble::follow(
             self.pos.0 as i32,
@@ -740,6 +886,26 @@ impl App {
 
     pub fn fixed(&self) -> bool {
         self.beh.physics.fixed
+    }
+
+    /// 面板改工资配置。时间串原样存下，合法性交给 `salary::progress` 判断，
+    /// 面板这边不拦 —— 输到一半的 `09:` 也要能存进内存，等改完再算。
+    pub fn set_salary(
+        &mut self,
+        on: bool,
+        work_start: String,
+        work_end: String,
+        lunch_start: String,
+        lunch_end: String,
+        month: u32,
+    ) {
+        self.user.salary = on;
+        self.user.work_start = work_start;
+        self.user.work_end = work_end;
+        self.user.lunch_start = lunch_start;
+        self.user.lunch_end = lunch_end;
+        self.user.salary_month = month;
+        self.save_user();
     }
 
     pub fn set_fixed(&mut self, on: bool) {
@@ -1873,6 +2039,19 @@ pub struct UserSettings {
     pub bubble: bool,
     #[serde(default = "d_true")]
     pub bubble_names: bool,
+    // ---- 数工资 ----
+    #[serde(default)]
+    pub salary: bool,
+    #[serde(default = "d_work_start")]
+    pub work_start: String,
+    #[serde(default = "d_work_end")]
+    pub work_end: String,
+    #[serde(default = "d_lunch_start")]
+    pub lunch_start: String,
+    #[serde(default = "d_lunch_end")]
+    pub lunch_end: String,
+    #[serde(default = "d_salary_month")]
+    pub salary_month: u32,
     #[serde(default)]
     pub x: Option<i32>,
     #[serde(default)]
@@ -1887,6 +2066,21 @@ fn d_alpha() -> u8 {
 }
 pub(crate) fn d_true() -> bool {
     true
+}
+fn d_work_start() -> String {
+    "09:00".to_string()
+}
+fn d_work_end() -> String {
+    "18:00".to_string()
+}
+fn d_lunch_start() -> String {
+    "12:00".to_string()
+}
+fn d_lunch_end() -> String {
+    "13:00".to_string()
+}
+fn d_salary_month() -> u32 {
+    8000
 }
 
 impl Default for UserSettings {
@@ -1908,6 +2102,12 @@ impl Default for UserSettings {
             greet_startup: true,
             bubble: true,
             bubble_names: true,
+            salary: false,
+            work_start: d_work_start(),
+            work_end: d_work_end(),
+            lunch_start: d_lunch_start(),
+            lunch_end: d_lunch_end(),
+            salary_month: d_salary_month(),
             x: None,
             y: None,
         }

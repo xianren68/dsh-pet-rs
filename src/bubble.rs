@@ -2,17 +2,21 @@
 //!
 //! 气泡窗自己也是一个 `WS_EX_LAYERED` 窗口，但它整窗 `WS_EX_TRANSPARENT`，
 //! 永远不吃鼠标。文字用 GDI 画进 32 位 DIB，再把非透明像素的 alpha 补上。
+//!
+//! **形状**：圆角主体 + 一条指向角色的三角尾巴，整体在 4 倍画布上画完再缩回——
+//! GDI 的 `RoundRect` / `Polygon` 不做抗锯齿，直接 1× 画出来边缘是阶梯状的。
+//! 超采样后走 `scale::scale` 的双线性缩，边缘才有柔和过渡。
 
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::{HWND, RECT};
+use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateFontW, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, GetDC,
-    GetDeviceCaps, GetStockObject, Rectangle, ReleaseDC, RoundRect, SelectObject, SetBkMode,
-    SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH,
-    DT_CALCRECT, DT_CENTER, DT_NOPREFIX, DT_WORDBREAK, FF_DONTCARE, HGDIOBJ, LOGPIXELSY, NULL_PEN,
-    OUT_DEFAULT_PRECIS, TRANSPARENT,
+    GetDeviceCaps, GetStockObject, Polygon, Rectangle, ReleaseDC, RoundRect, SelectObject,
+    SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+    DEFAULT_PITCH, DT_CALCRECT, DT_CENTER, DT_NOPREFIX, DT_WORDBREAK, FF_DONTCARE, HGDIOBJ,
+    LOGPIXELSY, NULL_PEN, OUT_DEFAULT_PRECIS, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -26,8 +30,15 @@ use crate::surface::Surface;
 use crate::util::{to_wide, work_area_at};
 
 const CLASS_NAME: &str = "DshPetBubble";
-const DEFAULT_TEXT_COLOR: u32 = 0x00FF_FFFF;
-const DEFAULT_BG_COLOR: u32 = 0x002B2B2B;
+const DEFAULT_TEXT_COLOR: u32 = 0x0057_4A_3D;
+const DEFAULT_BG_COLOR: u32 = 0x00FF_FFFF;
+const DEFAULT_BORDER_COLOR: u32 = 0x00C0_B8_A8;
+
+/// 超采样倍数。4 倍是体积/画质的折中：再高收益递减，内存翻倍。
+const SS: i32 = 4;
+/// 尾巴底边宽、高度（逻辑像素，96 DPI 基准）
+const TAIL_W: i32 = 24;
+const TAIL_H: i32 = 13;
 
 /// 把 JSON 里的逻辑尺寸换算成当前 DPI 下的像素。
 struct RenderStyle {
@@ -40,6 +51,11 @@ struct RenderStyle {
     radius: i32,
     pad: i32,
     max_w: i32,
+    /// 尾巴高度（已按 DPI 缩放），0 表示不带尾巴
+    tail_h: i32,
+    border_color: u32,
+    /// 描边宽度（已按 DPI 缩放），0 = 不描边
+    border_w: i32,
 }
 
 impl RenderStyle {
@@ -55,7 +71,7 @@ impl RenderStyle {
 
         let font_family = style.font_family.trim();
         let font_family = if font_family.is_empty() {
-            "Microsoft YaHei UI".to_string()
+            "YouYuan".to_string()
         } else {
             font_family.to_string()
         };
@@ -70,6 +86,9 @@ impl RenderStyle {
             radius: scale(style.corner_radius).clamp(0, 64),
             pad,
             max_w,
+            tail_h: scale(TAIL_H).clamp(0, 48),
+            border_color: parse_color(&style.border_color).unwrap_or(DEFAULT_BORDER_COLOR),
+            border_w: scale(style.border_width).clamp(0, 12),
         }
     }
 }
@@ -107,8 +126,14 @@ pub fn show(text: &str, pet_x: i32, pet_y: i32, pet_w: i32, pet_h: i32, style: &
         };
         b.surface = surface;
     }
-    draw(&mut b.surface, text, &style);
-    let (x, y) = place(pet_x, pet_y, pet_w, pet_h, w, h);
+    let (x, y, tail_top) = place(pet_x, pet_y, pet_w, pet_h, w, h);
+    draw(&mut b.surface, text, &style, tail_top);
+    // 调试：设了环境变量就把这一帧存到临时目录，用来眼睛看渲染结果
+    if std::env::var_os("DSH_DUMP_BUBBLE").is_some() {
+        let p = std::env::temp_dir().join("bubble_dump.png");
+        dump_surface(&mut b.surface, &p);
+        eprintln!("[bubble] dump -> {}", p.display());
+    }
     b.surface.present(b.hwnd, x, y, 255);
     unsafe {
         ShowWindow(b.hwnd, SW_SHOWNOACTIVATE);
@@ -123,7 +148,7 @@ pub fn follow(pet_x: i32, pet_y: i32, pet_w: i32, pet_h: i32) {
     if unsafe { IsWindowVisible(b.hwnd) } == 0 {
         return;
     }
-    let (x, y) = place(pet_x, pet_y, pet_w, pet_h, b.surface.w, b.surface.h);
+    let (x, y, _) = place(pet_x, pet_y, pet_w, pet_h, b.surface.w, b.surface.h);
     b.surface.present(b.hwnd, x, y, 255);
 }
 
@@ -141,6 +166,27 @@ pub fn destroy() {
             DestroyWindow(b.hwnd);
         }
     }
+}
+
+/// 把当前表面存成 PNG，调试用。像素是 0xAARRGGBB，直接拆成 RGBA。
+fn dump_surface(surface: &mut Surface, path: &std::path::Path) {
+    let (w, h) = (surface.w.max(0) as u32, surface.h.max(0) as u32);
+    if w == 0 || h == 0 {
+        return;
+    }
+    let px = surface.pixels();
+    let mut img = image::RgbaImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let p = px[(y * w + x) as usize];
+            img.put_pixel(
+                x,
+                y,
+                image::Rgba([(p >> 16) as u8, (p >> 8) as u8, p as u8, (p >> 24) as u8]),
+            );
+        }
+    }
+    let _ = img.save(path);
 }
 
 fn create() -> Option<Bubble> {
@@ -238,11 +284,17 @@ fn make_font(px: i32, family: &str, weight: i32) -> HGDIOBJ {
 }
 
 fn metrics(text: &str, style: &RenderStyle) -> (i32, i32) {
-    let chars = text.chars().count().min(10_000).max(1) as i32;
+    // 多行文案（数工资那种两行）要按最长的一行算宽度，否则 \n 会被当成字符撑宽
+    let chars = text
+        .lines()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(1)
+        .clamp(1, 10_000) as i32;
     let min_w = (style.pad * 2 + style.font_px * 4).max(96);
     let w = (chars * style.font_px + style.pad * 2).clamp(min_w, style.max_w);
-    let h = measure_height(text, w, style) + style.pad * 2;
-    (w, h.max(style.font_px + style.pad * 2))
+    let h = measure_height(text, w, style) + style.pad * 2 + style.tail_h;
+    (w, h.max(style.font_px + style.pad * 2 + style.tail_h))
 }
 
 fn measure_height(text: &str, w: i32, style: &RenderStyle) -> i32 {
@@ -279,34 +331,91 @@ fn measure_height(text: &str, w: i32, style: &RenderStyle) -> i32 {
     }
 }
 
-fn draw(surface: &mut Surface, text: &str, style: &RenderStyle) {
-    surface.pixels().fill(0);
-    let hdc = surface.hdc();
-    let radius = style.radius.min(surface.w / 2).min(surface.h / 2).max(0);
+/// 尾巴在 `tail_h` 处的半宽。按 TAIL_W:TAIL_H 的比例从高度推出来，
+/// 这样超采样倍数变了也不用跟着改。
+fn tail_half(tail_h: i32) -> i32 {
+    (tail_h as f32 * TAIL_W as f32 / TAIL_H as f32 / 2.0).round() as i32
+}
+
+/// 画一帧气泡。
+///
+/// 全程在 `SS` 倍画布上做，最后缩回 1×。GDI 的 RoundRect / Polygon 不带抗锯齿，
+/// 1× 直接画出来圆角和尾巴斜边都是阶梯状的。
+fn draw(surface: &mut Surface, text: &str, style: &RenderStyle, tail_on_top: bool) {
+    let w = surface.w;
+    let h = surface.h;
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let tail = style.tail_h.min(h / 2);
+    // 主体在逻辑坐标里的上下边界（尾巴占掉的那一条不算）
+    let (body_top, body_bottom) = if tail_on_top {
+        (tail, h)
+    } else {
+        (0, h - tail)
+    };
+
+    let hw = w * SS;
+    let hh = h * SS;
+    let Some(mut hi) = Surface::new(hw, hh) else {
+        return;
+    };
+    hi.pixels().fill(0);
+    let hdc = hi.hdc();
+
     unsafe {
-        let font = make_font(style.font_px, &style.font_family, style.font_weight);
+        let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+        let (bt, bb) = (body_top * SS, body_bottom * SS);
+        let tail_hi = tail * SS;
+        let radius = (style.radius * SS).min(hw / 2).min(hh / 2).max(0);
+        let border_w = style.border_w * SS;
+
+        // 两层填充：外层描边色打满，内层背景色内缩覆盖，露出来的一圈就是描边。
+        // 浅色底在浅色桌面上没有描边等于隐形，GDI 又画不了阴影，这是最稳的办法。
+        if border_w > 0 {
+            let outer = CreateSolidBrush(style.border_color);
+            let old_b = SelectObject(hdc, outer as HGDIOBJ);
+            fill_shape(hdc, hw, hh, bt, bb, radius, tail_hi, tail_on_top, 0);
+            SelectObject(hdc, old_b);
+            DeleteObject(outer as HGDIOBJ);
+        }
+
+        let brush = CreateSolidBrush(style.background_color);
+        let old_brush = SelectObject(hdc, brush as HGDIOBJ);
+        fill_shape(hdc, hw, hh, bt, bb, radius, tail_hi, tail_on_top, border_w);
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        DeleteObject(brush as HGDIOBJ);
+
+        // 文字：字号跟着 ×SS，垂直居中在主体内（尾巴不参与）
+        let font = make_font(style.font_px * SS, &style.font_family, style.font_weight);
         let old_font = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT as i32);
         SetTextColor(hdc, style.text_color);
 
-        let brush = CreateSolidBrush(style.background_color);
-        let old_brush = SelectObject(hdc, brush as HGDIOBJ);
-        let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
-        if radius > 0 {
-            RoundRect(hdc, 0, 0, surface.w, surface.h, radius * 2, radius * 2);
-        } else {
-            Rectangle(hdc, 0, 0, surface.w, surface.h);
-        }
-        SelectObject(hdc, old_pen);
-        SelectObject(hdc, old_brush);
-
-        let mut rect = RECT {
-            left: style.pad,
-            top: style.pad,
-            right: surface.w - style.pad,
-            bottom: surface.h - style.pad,
-        };
+        let pad = style.pad * SS;
         let wide = to_wide(text);
+        let mut probe = RECT {
+            left: 0,
+            top: 0,
+            right: (hw - pad * 2).max(1),
+            bottom: 0,
+        };
+        DrawTextW(
+            hdc,
+            wide.as_ptr(),
+            -1,
+            &mut probe,
+            DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+        );
+        let text_h = (probe.bottom - probe.top).max(1);
+        let body_h = bb - bt;
+        let mut rect = RECT {
+            left: pad,
+            top: bt + (body_h - text_h) / 2,
+            right: hw - pad,
+            bottom: bb,
+        };
         DrawTextW(
             hdc,
             wide.as_ptr(),
@@ -316,32 +425,110 @@ fn draw(surface: &mut Surface, text: &str, style: &RenderStyle) {
         );
 
         SelectObject(hdc, old_font);
-        DeleteObject(brush as HGDIOBJ);
         DeleteObject(font);
     }
 
-    apply_alpha(surface, style.alpha, radius);
+    // 补 alpha（GDI 只写 RGB），然后缩回 1×
+    apply_alpha(&mut hi, style.alpha, style.radius * SS, tail * SS, tail_on_top);
+    let small = crate::scale::scale(
+        hi.pixels(),
+        hw as usize,
+        hh as usize,
+        w as usize,
+        h as usize,
+    );
+    surface.upload(&small);
 }
 
-/// GDI 只写 RGB。按圆角矩形的几何形状补 alpha 并预乘，避免背景色是纯黑时
-/// 被误判成“没画过的像素”。圆角外的像素保持完全透明。
-fn apply_alpha(surface: &mut Surface, alpha: u32, radius: i32) {
+/// 在超采样画布上填一块「圆角主体 + 尾巴」，整体向内缩 `inset` 像素。
+///
+/// 画两遍就得到描边：先 `inset = 0` 用描边色打满，再 `inset = border_w` 用背景色覆盖。
+unsafe fn fill_shape(
+    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+    w: i32,
+    h: i32,
+    bt: i32,
+    bb: i32,
+    radius: i32,
+    tail_hi: i32,
+    tail_on_top: bool,
+    inset: i32,
+) {
+    let (bt, bb) = (bt + inset, bb - inset);
+    if bb <= bt || w - inset * 2 <= 0 {
+        return;
+    }
+    let r = (radius - inset).max(0).min((bb - bt) / 2);
+    if r > 0 {
+        RoundRect(hdc, inset, bt, w - inset, bb, r * 2, r * 2);
+    } else {
+        Rectangle(hdc, inset, bt, w - inset, bb);
+    }
+
+    let th = tail_hi - inset;
+    if th > 0 {
+        let half = (tail_half(tail_hi) - inset).max(1).min(w / 2);
+        let cx = w / 2;
+        let mut pts = if tail_on_top {
+            [
+                POINT { x: cx - half, y: bt },
+                POINT { x: cx + half, y: bt },
+                POINT { x: cx, y: inset },
+            ]
+        } else {
+            [
+                POINT { x: cx - half, y: bb },
+                POINT { x: cx + half, y: bb },
+                POINT { x: cx, y: h - inset },
+            ]
+        };
+        Polygon(hdc, pts.as_mut_ptr(), 3);
+    }
+}
+
+/// GDI 只写 RGB。按「圆角主体 + 三角尾巴」的几何形状补 alpha 并预乘，
+/// 形状外的像素保持完全透明。在超采样画布上做，缩小时边缘自然过渡。
+fn apply_alpha(surface: &mut Surface, alpha: u32, radius: i32, tail_h: i32, tail_on_top: bool) {
     let alpha = alpha.min(255);
     let w = surface.w;
     let h = surface.h;
     let radius = radius.min(w / 2).min(h / 2).max(0);
+    let tail_h = tail_h.min(h / 2).max(0);
+    let (bt, bb) = if tail_on_top {
+        (tail_h, h)
+    } else {
+        (0, h - tail_h)
+    };
+    let half = tail_half(tail_h);
+    let cx = w / 2;
+
     let pixels = surface.pixels();
     for y in 0..h {
+        let in_body = y >= bt && y < bb;
         for x in 0..w {
             let p = &mut pixels[(y * w + x) as usize];
-            if alpha == 0 || !inside_round_rect(x, y, w, h, radius) {
+            let solid = if in_body {
+                inside_round_rect(x, y - bt, w, bb - bt, radius)
+            } else if tail_h > 0 {
+                // 尾巴区间：按离底边的距离线性收窄
+                let t = if tail_on_top {
+                    y as f32 / tail_h as f32
+                } else {
+                    (h - y) as f32 / tail_h as f32
+                };
+                let t = t.clamp(0.0, 1.0);
+                let half_w = half as f32 * t;
+                ((x - cx) as f32).abs() <= half_w
+            } else {
+                false
+            };
+            if alpha == 0 || !solid {
                 *p = 0;
                 continue;
             }
-            let b = (*p & 0xFF) * alpha / 255;
-            let g = ((*p >> 8) & 0xFF) * alpha / 255;
-            let r = ((*p >> 16) & 0xFF) * alpha / 255;
-            *p = (alpha << 24) | (r << 16) | (g << 8) | b;
+            // 只写 alpha，**不预乘** —— 预乘统一由 Surface::upload 做。
+            // 这里如果乘了，scale 会再乘一次、upload 再乘第三次，气泡会一路发暗。
+            *p = (alpha << 24) | (*p & 0x00FF_FFFF);
         }
     }
 }
@@ -360,14 +547,20 @@ fn inside_round_rect(x: i32, y: i32, w: i32, h: i32, radius: i32) -> bool {
     dx * dx + dy * dy <= radius * radius
 }
 
-fn place(pet_x: i32, pet_y: i32, pet_w: i32, pet_h: i32, w: i32, h: i32) -> (i32, i32) {
+/// 气泡位置：尾巴尖贴着角色头顶（素材里角色头顶在画面 15.5% 高度处）。
+/// 上方放不下就翻到脚下，此时尾巴朝上，尖仍指向角色。
+fn place(pet_x: i32, pet_y: i32, pet_w: i32, pet_h: i32, w: i32, h: i32) -> (i32, i32, bool) {
     let wa = work_area_at(pet_x + pet_w / 2, pet_y + pet_h / 2);
     let mut x = pet_x + pet_w / 2 - w / 2;
-    let mut y = pet_y - h - 8;
-    if y < wa.top {
-        y = pet_y + pet_h + 8;
-    }
+    let head_top = pet_y + (pet_h as f32 * 0.155) as i32;
+    let foot = pet_y + (pet_h as f32 * 0.92) as i32;
+
+    let (mut y, tail_on_top) = if head_top - h - 2 >= wa.top {
+        (head_top - h - 2, false)
+    } else {
+        (foot + 2, true)
+    };
     x = x.clamp(wa.left, (wa.right - w).max(wa.left));
     y = y.clamp(wa.top, (wa.bottom - h).max(wa.top));
-    (x, y)
+    (x, y, tail_on_top)
 }
