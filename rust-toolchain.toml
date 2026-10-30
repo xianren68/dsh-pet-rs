@@ -1,0 +1,6 @@
+# 本分支专门编 Win7 兼容版。Rust 1.78 起标准库放弃 Win7，
+# futex / 哈希随机源会静态导入 Win8+/Win10 才有的 API，加载期直接死；
+# 1.77 及以前这些都有运行时降级。master 分支没有这个文件，继续用 stable。
+[toolchain]
+channel = "1.77.2"
+profile = "minimal"

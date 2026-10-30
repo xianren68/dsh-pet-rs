@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Power::{
     RegisterPowerSettingNotification, UnregisterPowerSettingNotification, HPOWERNOTIFY,
     POWERBROADCAST_SETTING,
@@ -36,9 +36,7 @@ use windows_sys::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION,
 };
 use windows_sys::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
-use windows_sys::Win32::UI::HiDpi::{
-    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-};
+use windows_sys::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse as km;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW,
@@ -98,8 +96,19 @@ fn main() {
     }
 
     unsafe {
-        // Per-Monitor V2：拿物理像素坐标，跨屏拖动能自适应缩放
-        let dpi_ok = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // Per-Monitor V2：拿物理像素坐标，跨屏拖动能自适应缩放。
+        // SetProcessDpiAwarenessContext 是 Win10 1703 才有的 API，必须运行时取：
+        // 静态导入会让 Win7/8 的加载器在启动那一刻就失败（0xc0000005）。
+        // 拿不到（老系统）就退回 Vista 时代就有的 SetProcessDPIAware。
+        type SetDpiCtx = unsafe extern "system" fn(*mut std::ffi::c_void) -> i32;
+        let mut dpi_ok = 0;
+        let user32 = GetModuleHandleW(to_wide("user32.dll").as_ptr());
+        if !user32.is_null() {
+            if let Some(p) = GetProcAddress(user32, b"SetProcessDpiAwarenessContext\0".as_ptr()) {
+                let f: SetDpiCtx = std::mem::transmute(p);
+                dpi_ok = f(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            }
+        }
         eprintln!("[dpi] per-monitor-v2 -> {dpi_ok}");
         if dpi_ok == 0 {
             let old = SetProcessDPIAware();

@@ -108,7 +108,7 @@ struct Panel {
 static mut PANEL: Option<Panel> = None;
 
 fn panel() -> Option<&'static mut Panel> {
-    unsafe { (*(&raw mut PANEL)).as_mut() }
+    unsafe { (*std::ptr::addr_of_mut!(PANEL)).as_mut() }
 }
 
 fn size_text(w: u32) -> String {
@@ -679,7 +679,7 @@ fn create() {
             ID_CLOSE,
         );
 
-        *(&raw mut PANEL) = Some(Panel {
+        std::ptr::addr_of_mut!(PANEL).write(Some(Panel {
             hwnd,
             font,
             size,
@@ -710,7 +710,7 @@ fn create() {
             ed_lunch_start,
             ed_lunch_end,
             ed_salary_month,
-        });
+        }));
 
         set_slider(size, w0.clamp(MIN_W, MAX_W));
         set_slider(alpha, a0 as u32);
@@ -855,7 +855,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     DeleteObject(p.font as _);
                 }
             }
-            *(&raw mut PANEL) = None;
+            std::ptr::addr_of_mut!(PANEL).write(None);
             0
         }
 

@@ -141,8 +141,8 @@ dsh-pet-rs —— 极简原生 Windows 桌宠
   同一时间只会运行一只；重复双击会提示已在运行。
 
 【兼容性】
-  Windows 10 / 11，64 位。
-  环境感知没有使用 Win8+ 独占 API；Win7 构建见 win7-compat 分支。
+  本包为 Win7 兼容版：Windows 7 SP1 / 8.1 / 10 / 11，64 位。
+  （DPI API 运行时加载，Rust 1.77 编译；普通 Win10/11 用户用主包即可）
   首次运行会在配置目录生成 icon.ico，属正常现象。
 
 【版权】
@@ -159,7 +159,7 @@ Write-Host ("    总计     {0:N1} MB" -f ($allSize / 1MB))
 
 if ($Zip) {
     Write-Host "==> 打包 zip" -ForegroundColor Cyan
-    $zipPath = Join-Path $root (Join-Path $Out "$name.zip")
+    $zipPath = Join-Path $root (Join-Path $Out "$name-win7.zip")
     if ([System.IO.File]::Exists($zipPath)) { [System.IO.File]::Delete($zipPath) }
     # 传目录本身（不是 $pkg\*），解压出来才有顶层 dsh-pet-rs\ 目录
     Compress-Archive -Path $pkg -DestinationPath $zipPath

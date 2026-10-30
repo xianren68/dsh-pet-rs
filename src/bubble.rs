@@ -101,7 +101,8 @@ struct Bubble {
 static mut BUBBLE: Option<Bubble> = None;
 
 fn slot() -> &'static mut Option<Bubble> {
-    unsafe { &mut *(&raw mut BUBBLE) }
+    // 本分支要能过 Rust 1.77：`&raw mut` 是 1.82 的语法，得用 addr_of_mut!
+    unsafe { &mut *std::ptr::addr_of_mut!(BUBBLE) }
 }
 
 pub fn show(text: &str, pet_x: i32, pet_y: i32, pet_w: i32, pet_h: i32, style: &BubbleStyle) {
