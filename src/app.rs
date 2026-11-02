@@ -829,8 +829,12 @@ impl App {
                     );
                 }
             }
-            let path = std::env::temp_dir().join(format!("pet_dump_{:03}.png", self.frame));
-            let _ = img.save(&path);
+            let dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+            let path = dir.join(format!("pet_dump_{:03}.png", self.frame));
+            match img.save(&path) {
+                Ok(_) => eprintln!("[dump] frame={} -> {}", self.frame, path.display()),
+                Err(e) => eprintln!("[dump] frame={} 保存失败: {e}", self.frame),
+            }
         }
         self.dirty = false;
         bubble::follow(
