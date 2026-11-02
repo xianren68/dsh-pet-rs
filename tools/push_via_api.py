@@ -8,9 +8,12 @@ import sys
 import urllib.request
 
 REPO = "xianren68/dsh-pet-rs"
-BRANCH = "main"
-BASE = "ef03e50"          # 远程当前 HEAD
-HEAD = "f3e9f7e"          # 本地要推的 commit
+BRANCH = os.environ.get("PUSH_BRANCH", "main")
+# 不传文件名时，按 BASE..HEAD 的全量改动推。BASE 用上一轮的远程提交即可。
+BASE = os.environ.get("PUSH_BASE", "ef03e50")
+HEAD = subprocess.run(
+    ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+).stdout.strip()
 
 
 def token():
@@ -45,8 +48,16 @@ def call(method, url, payload=None):
 
 
 def main():
-    remote = call("GET", f"{API}/git/ref/heads/{BRANCH}")
-    remote_sha = remote["object"]["sha"]
+    # 目标分支可能还不存在（比如新建的 win7-compat），先探一下
+    try:
+        remote = call("GET", f"{API}/git/ref/heads/{BRANCH}")
+        remote_sha = remote["object"]["sha"]
+        exists = True
+    except Exception:
+        base_ref = call("GET", f"{API}/git/ref/heads/main")
+        remote_sha = base_ref["object"]["sha"]
+        exists = False
+        print(f"分支 {BRANCH} 不存在，将基于 main ({remote_sha[:7]}) 创建")
     print(f"远程 HEAD: {remote_sha[:7]}")
 
     # 命令行传了文件名就用它，否则按本地 commit 的全部改动推
@@ -89,7 +100,14 @@ def main():
     )
     print(f"新 commit: {commit['sha'][:7]}")
 
-    call("PATCH", f"{API}/git/refs/heads/{BRANCH}", {"sha": commit["sha"]})
+    if exists:
+        call("PATCH", f"{API}/git/refs/heads/{BRANCH}", {"sha": commit["sha"]})
+    else:
+        call(
+            "POST",
+            f"{API}/git/refs",
+            {"ref": f"refs/heads/{BRANCH}", "sha": commit["sha"]},
+        )
     print(f"已更新 {BRANCH} -> {commit['sha'][:7]}")
 
 
